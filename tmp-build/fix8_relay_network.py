@@ -80,7 +80,6 @@ if marker not in s:
     raise SystemExit("service_name block not found")
 s = s.replace(marker, insert, 1)
 
-# Cloudflare deployment/delete API should follow the same networking policy too.
 old = '''    let identity = load_or_create_identity(&profile.id, kind)?;
     let public_key_b64 = URL_SAFE_NO_PAD.encode(identity.signing_key.verifying_key().as_bytes());
     let client = cloudflare_client()?;
@@ -94,10 +93,6 @@ if old not in s:
     raise SystemExit("deploy cloudflare client block not found")
 s = s.replace(old, new, 1)
 
-# Deployment is a two-stage operation: Cloudflare API mutation, then verification.
-# Once upload + workers.dev enable succeeded, a LOCAL transport failure must not be
-# reported as if the remote deployment never happened. Protocol/identity mismatch
-# remains a hard failure.
 old = '''    let public_url = format!("https://{worker_name}.{account_subdomain}.workers.dev");
     let health = probe_url(&public_url).await?;
     if !health.ok || health.service != service_name(kind) || health.relay_version != "1" {
@@ -174,13 +169,10 @@ if old not in s:
     raise SystemExit("send_update relay client block not found")
 s = s.replace(old, new, 1)
 
-# Replace probe/client helpers. Keep protocol failures distinct from pure transport
-# failures so only the latter can be downgraded after a confirmed Cloudflare deploy.
 start = s.find('async fn probe_url(public_url: &str) -> AppResult<PublicRelayHealth> {')
 end = s.find('\nasync fn cf_json<', start)
 if start == -1 or end == -1:
     raise SystemExit("probe/client helper region not found")
-old_region = s[start:end]
 new_region = '''async fn probe_url(public_url: &str, use_proxy: bool) -> AppResult<PublicRelayHealth> {
     let url = format!("{}/__ctm/health", public_url.trim_end_matches('/'));
     let mut last_transport_error: Option<String> = None;
@@ -245,7 +237,6 @@ fn cloudflare_client(use_proxy: bool) -> AppResult<reqwest::Client> {
 '''
 s = s[:start] + new_region + s[end:]
 
-# Extend the existing relay tests with deterministic proxy-policy checks.
 insert = '''
 
     #[test]
@@ -279,51 +270,31 @@ s = s[:pos] + insert + s[pos:]
 write(p, s)
 
 # ---------------------------------------------------------------------------
-# Tauri deployment command: after the remote Worker has been created and local
-# config saved, failures in restart/initial sync are warnings, not a false
-# "deployment failed" transaction result. The renewal task already retries sync.
+# After Cloudflare mutation + local config save, a service restart failure is a
+# partial-success warning. The current fix7 source already treats initial target
+# sync failure as a warning and starts the renewal retry task.
 # ---------------------------------------------------------------------------
 p = Path("app/src-tauri/src/commands/relay.rs")
 s = read(p)
-s = s.replace('    let result = deploy_result?;\n', '    let mut result = deploy_result?;\n', 1)
-
-old = '''    if let Err(error) = restart_if_running(&state, &id, kind).await {
-        return Err(AppError::Message(format!(
-            "Relay 已部署到 {}，但当前服务自动重启失败：{error}。Relay 配置已保存；请手动重新启动该服务一次。",
-            result.public_url
-        )));
+old = '''    if previous_canonical != next_canonical {
+        if let Err(error) = restart_if_running(&state, &id, kind).await {
+            return Err(AppError::Message(format!(
+                "Relay 已部署到 {}，但当前服务自动重启失败：{error}。Relay 配置已保存；请手动重新启动该服务一次。",
+                result.public_url
+            )));
+        }
     }
 '''
-new = '''    if let Err(error) = restart_if_running(&state, &id, kind).await {
-        result.message.push_str(&format!(
-            " 当前服务自动重启失败：{error}。Relay 已部署且配置已保存，请手动重新启动该服务一次。"
-        ));
-    }
-'''
-if old not in s:
-    raise SystemExit("post-deploy restart block not found")
-s = s.replace(old, new, 1)
-
-old = '''    if status.state == "running" && relay::is_valid_quick_target(&status.public_url) {
-        let current = profile_by_id(&state, &id)?;
-        relay::activate_lease(&current, kind, &status.public_url).await?;
-    }
-
-    Ok(result)
-'''
-new = '''    if status.state == "running" && relay::is_valid_quick_target(&status.public_url) {
-        let current = profile_by_id(&state, &id)?;
-        if let Err(error) = relay::activate_lease(&current, kind, &status.public_url).await {
+new = '''    if previous_canonical != next_canonical {
+        if let Err(error) = restart_if_running(&state, &id, kind).await {
             result.message.push_str(&format!(
-                " 当前 Quick Tunnel 的首次 Relay 同步暂时失败：{error}。后台续租任务会继续自动重试，无需重启 Tunnel。"
+                " 当前服务自动重启失败：{error}。Relay 已部署且配置已保存，请手动重新启动该服务一次。"
             ));
         }
     }
-
-    Ok(result)
 '''
 if old not in s:
-    raise SystemExit("post-deploy sync block not found")
+    raise SystemExit("current post-deploy restart block not found")
 s = s.replace(old, new, 1)
 write(p, s)
 
