@@ -1,0 +1,149 @@
+         return (
+             StatusCode::BAD_REQUEST,
+@@ -352,9 +388,13 @@ fn oauth_not_configured() -> Response {
+ 
+ async fn execute_action(
+     State(state): State<AppState>,
++    headers: HeaderMap,
+     Path(tool_name): Path<String>,
+     body: Option<Json<Value>>,
+ ) -> Response {
++    if let Some(response) = require_relay_origin(&state, &headers) {
++        return response;
++    }
+     let arguments = match body {
+         Some(Json(value)) if value.is_object() || value.is_null() => {
+             if value.is_null() {
+diff --git a/src-tauri/src/commands/mod.rs b/src-tauri/src/commands/mod.rs
+index 5ef4d63..3bfe212 100644
+--- a/src-tauri/src/commands/mod.rs
++++ b/src-tauri/src/commands/mod.rs
+@@ -1,6 +1,7 @@
+ mod app_info;
+ mod frp_profiles;
+ mod health;
++mod relay;
+ mod logs;
+ pub(crate) mod runtime;
+ mod secrets;
+@@ -18,6 +19,7 @@ pub use frp_profiles::{
+     save_frp_profile, set_last_workspace, set_proxy,
+ };
+ pub use health::run_health_checks;
++pub use relay::{delete_cloudflare_relay, deploy_cloudflare_relay, get_cloudflare_relay_status, sync_cloudflare_relay};
+ pub use logs::read_workspace_logs;
+ pub use runtime::{
+     get_actions_runtime_status, get_runtime_status, restart_actions_runtime, restart_runtime,
+diff --git a/src-tauri/src/commands/runtime.rs b/src-tauri/src/commands/runtime.rs
+index d145bd6..a14c958 100644
+--- a/src-tauri/src/commands/runtime.rs
++++ b/src-tauri/src/commands/runtime.rs
+@@ -8,6 +8,7 @@ use tokio::sync::Mutex as AsyncMutex;
+ use crate::app_state::AppState;
+ use crate::error::{AppError, AppResult};
+ use crate::platform::platform;
++use crate::relay;
+ use crate::runtime::{
+     await_listener_shutdown, port_busy_message, try_reclaim_previous_macos_app_port,
+     wait_for_port_free, ServiceKind,
+@@ -118,6 +119,7 @@ async fn stop_mcp_service(state: &AppState, id: &str) -> AppResult<RuntimeStatus
+         Ok(runtime.mcp_status(&profile))
+     })?;
+     stop_for_runtime(&profile, TunnelServiceKind::Mcp).await?;
++    relay::deactivate_lease(&profile, TunnelServiceKind::Mcp).await;
+     if is_quick_cloudflare(&profile, TunnelServiceKind::Mcp) {
+         persist_tunnel_url(state, id, TunnelServiceKind::Mcp, "")?;
+     }
+@@ -133,14 +135,20 @@ async fn start_mcp_service(state: &AppState, id: &str) -> AppResult<RuntimeStatu
+     sync_tunnel_routes_from_runtime(state).await?;
+ 
+     let mut tunnel_error = None;
++    let mut relay_error = None;
+     match maybe_start_for_runtime(&profile, TunnelServiceKind::Mcp).await {
+         Ok(Some(url)) => {
+             persist_tunnel_url(state, id, TunnelServiceKind::Mcp, &url)?;
++            let current = profile_by_id(state, id)?;
++            if let Err(error) = relay::activate_lease(&current, TunnelServiceKind::Mcp, &url).await {
++                relay_error = Some(error.to_string());
++            }
+         }
+         Ok(None) => {}
+         Err(error) => {
+             eprintln!("mcp tunnel auto-start failed for {id}: {error}");
+             tunnel_error = Some(error.to_string());
++            relay::deactivate_lease(&profile, TunnelServiceKind::Mcp).await;
+             if is_quick_cloudflare(&profile, TunnelServiceKind::Mcp) {
+                 persist_tunnel_url(state, id, TunnelServiceKind::Mcp, "")?;
+             }
+@@ -156,6 +164,10 @@ async fn start_mcp_service(state: &AppState, id: &str) -> AppResult<RuntimeStatu
+     if let Some(error) = tunnel_error {
+         status.public_endpoint.clear();
+         status.public_message = format!("公网隧道启动失败：{error}");
++    } else if let Some(error) = relay_error {
++        status.public_message = format!(
++            "Quick Tunnel 已启动，但 Relay 首次同步失败：{error}。程序会每 90 秒自动重试，无需重启服务。"
++        );
+     }
+     Ok(status)
+ }
+@@ -170,6 +182,7 @@ async fn stop_actions_service(state: &AppState, id: &str) -> AppResult<RuntimeSt
+         Ok(runtime.actions_status(&profile))
+     })?;
+     stop_for_runtime(&profile, TunnelServiceKind::Actions).await?;
++    relay::deactivate_lease(&profile, TunnelServiceKind::Actions).await;
+     if is_quick_cloudflare(&profile, TunnelServiceKind::Actions) {
+         persist_tunnel_url(state, id, TunnelServiceKind::Actions, "")?;
+     }
+@@ -185,14 +198,20 @@ async fn start_actions_service(state: &AppState, id: &str) -> AppResult<RuntimeS
+     sync_tunnel_routes_from_runtime(state).await?;
+ 
+     let mut tunnel_error = None;
++    let mut relay_error = None;
+     match maybe_start_for_runtime(&profile, TunnelServiceKind::Actions).await {
+         Ok(Some(url)) => {
+             persist_tunnel_url(state, id, TunnelServiceKind::Actions, &url)?;
++            let current = profile_by_id(state, id)?;
++            if let Err(error) = relay::activate_lease(&current, TunnelServiceKind::Actions, &url).await {
++                relay_error = Some(error.to_string());
++            }
+         }
+         Ok(None) => {}
+         Err(error) => {
+             eprintln!("actions tunnel auto-start failed for {id}: {error}");
+             tunnel_error = Some(error.to_string());
++            relay::deactivate_lease(&profile, TunnelServiceKind::Actions).await;
+             if is_quick_cloudflare(&profile, TunnelServiceKind::Actions) {
+                 persist_tunnel_url(state, id, TunnelServiceKind::Actions, "")?;
+             }
+@@ -208,6 +227,10 @@ async fn start_actions_service(state: &AppState, id: &str) -> AppResult<RuntimeS
+     if let Some(error) = tunnel_error {
+         status.public_endpoint.clear();
+         status.public_message = format!("公网隧道启动失败：{error}");
++    } else if let Some(error) = relay_error {
++        status.public_message = format!(
++            "Quick Tunnel 已启动，但 Relay 首次同步失败：{error}。程序会每 90 秒自动重试，无需重启服务。"
++        );
+     }
+     Ok(status)
+ }
+diff --git a/src-tauri/src/commands/tunnel.rs b/src-tauri/src/commands/tunnel.rs
+index bab79d9..2f03391 100644
+--- a/src-tauri/src/commands/tunnel.rs
++++ b/src-tauri/src/commands/tunnel.rs
+@@ -3,6 +3,7 @@ use tauri::State;
+ use crate::app_state::AppState;
+ use crate::error::{AppError, AppResult};
+ use crate::platform::platform;
++use crate::relay;
+ use crate::tunnel::{
+     frp_snippet, supervisor, sync_managed_runtime_routes, TunnelServiceKind, TunnelStatus,
+ };
+@@ -143,6 +144,17 @@ fn tunnel_type_for(profile: &crate::workspace::WorkspaceProfile, kind: TunnelSer
+     }
+ }
+ 
++async fn activate_relay_if_service_is_live(
++    profile: &crate::workspace::WorkspaceProfile,
++    kind: TunnelServiceKind,
++    public_url: &str,
++) -> AppResult<()> {
