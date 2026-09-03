@@ -1,0 +1,378 @@
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::LazyLock;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use ed25519_dalek::{Signer, SigningKey};
+use rand_core::{OsRng, RngCore};
+use tokio::sync::Mutex as AsyncMutex;
+use reqwest::multipart::{Form, Part};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use sha2::Digest;
+
+use crate::error::{AppError, AppResult};
+use crate::tunnel::TunnelServiceKind;
+use crate::workspace::{RelayConfig, WorkspaceProfile};
+
+const RELAY_DEPLOYMENT_VERSION: u32 = 1;
+const RELAY_LEASE_SECONDS: u32 = 300;
+const RELAY_RENEW_SECONDS: u64 = 90;
+const CLOUDFLARE_API_BASE: &str = "https://api.cloudflare.com/client/v4";
+const SECURE_SERVICE: &str = "com.codingtools.mcp.desktop.relay";
+const WORKER_SOURCE: &str = include_str!("worker.mjs");
+static LAST_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+struct LeaseTask {
+    target: String,
+    handle: tauri::async_runtime::JoinHandle<()>,
+}
+
+static LEASE_TASKS: LazyLock<AsyncMutex<HashMap<String, LeaseTask>>> =
+    LazyLock::new(|| AsyncMutex::new(HashMap::new()));
+
+fn lease_key(workspace_id: &str, kind: TunnelServiceKind) -> String {
+    format!("{}:{}", workspace_id, service_name(kind))
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RelayDeploymentResult {
+    pub public_url: String,
+    pub worker_name: String,
+    pub account_id: String,
+    pub deployment_version: u32,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RelayRemoteStatus {
+    pub configured: bool,
+    pub public_url: String,
+    pub state: String,
+    pub backend: String,
+    pub expires_in: u64,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone)]
+struct RelayIdentity {
+    signing_key: SigningKey,
+    origin_auth_token: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SignedUpdate<'a> {
+    service: &'a str,
+    target: &'a str,
+    offline: bool,
+    generation: u64,
+    timestamp_ms: u64,
+    lease_seconds: u32,
+    nonce: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CfEnvelope<T> {
+    success: bool,
+    #[serde(default)]
+    result: Option<T>,
+    #[serde(default)]
+    errors: Vec<CfError>,
+    #[serde(default)]
+    messages: Vec<CfError>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CfError {
+    #[serde(default)]
+    code: i64,
+    #[serde(default)]
+    message: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AccountSubdomain {
+    subdomain: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkerSubdomainStatus {
+    enabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PublicRelayHealth {
+    #[serde(default)]
+    ok: bool,
+    #[serde(default)]
+    relay_version: String,
+    #[serde(default)]
+    service: String,
+    #[serde(default)]
+    backend: String,
+    #[serde(default)]
+    expires_in: u64,
+}
+
+pub fn relay_config(profile: &WorkspaceProfile, kind: TunnelServiceKind) -> &RelayConfig {
+    match kind {
+        TunnelServiceKind::Mcp => &profile.tunnel.relay,
+        TunnelServiceKind::Actions => &profile.actions.relay,
+    }
+}
+
+pub fn relay_configured(profile: &WorkspaceProfile, kind: TunnelServiceKind) -> bool {
+    let config = relay_config(profile, kind);
+    config.enabled && !config.public_url.trim().is_empty() && !config.worker_name.trim().is_empty()
+}
+
+pub fn relay_enabled(profile: &WorkspaceProfile, kind: TunnelServiceKind) -> bool {
+    match kind {
+        TunnelServiceKind::Mcp => profile.mcp_relay_enabled(),
+        TunnelServiceKind::Actions => profile.actions_relay_enabled(),
+    }
+}
+
+pub fn relay_public_url(profile: &WorkspaceProfile, kind: TunnelServiceKind) -> String {
+    relay_config(profile, kind)
+        .public_url
+        .trim()
+        .trim_end_matches('/')
+        .to_string()
+}
+
+pub fn service_name(kind: TunnelServiceKind) -> &'static str {
+    match kind {
+        TunnelServiceKind::Mcp => "mcp",
+        TunnelServiceKind::Actions => "actions",
+    }
+}
+
+pub fn default_worker_name(workspace_id: &str, kind: TunnelServiceKind) -> String {
+    let suffix: String = workspace_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(16)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    let suffix = if suffix.len() >= 8 {
+        suffix
+    } else {
+        let digest = sha2::Sha256::digest(workspace_id.as_bytes());
+        hex_prefix(&digest, 12)
+    };
+    format!("ctm-relay-{}-{suffix}", service_name(kind))
+}
+
+pub fn is_valid_quick_target(target: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(target.trim()) else {
+        return false;
+    };
+    if url.scheme() != "https"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+        || url.query().is_some()
+    {
+        return false;
+    }
+    if url.port().is_some_and(|port| port != 443) {
+        return false;
+    }
+    if url.path() != "/" && !url.path().is_empty() {
+        return false;
+    }
+    let Some(host) = url.host_str().map(str::to_ascii_lowercase) else {
+        return false;
+    };
+    host.ends_with(".trycloudflare.com")
+        && host != "trycloudflare.com"
+        && host
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '-')
+}
+
+pub fn origin_auth_for(
+    profile: &WorkspaceProfile,
+    kind: TunnelServiceKind,
+) -> AppResult<Option<String>> {
+    if !relay_enabled(profile, kind) {
+        return Ok(None);
+    }
+    let identity = load_identity(&profile.id, kind)?.ok_or_else(|| {
+        AppError::Message(
+            "Relay 已启用，但本机安全凭据中的 Relay 身份密钥缺失。请使用 Cloudflare API Token 重新部署该 Relay。"
+                .into(),
+        )
+    })?;
+    Ok(Some(identity.origin_auth_token))
+}
+
+pub fn request_has_valid_origin_proof(
+    headers: &axum::http::HeaderMap,
+    expected_token: Option<&str>,
+) -> bool {
+    let Some(expected) = expected_token.filter(|value| !value.is_empty()) else {
+        return true;
+    };
+
+    // Local loopback callers (desktop health checks and direct localhost use) do not
+    // traverse the Relay and therefore cannot carry the origin proof. Trust only the
+    // raw Host header here; never X-Forwarded-Host, which remote clients can spoof.
+    let host = headers
+        .get(axum::http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let host_only = if host.starts_with('[') {
+        host.strip_prefix('[')
+            .and_then(|value| value.split_once(']'))
+            .map(|(value, _)| value)
+            .unwrap_or("")
+    } else {
+        host.split(':').next().unwrap_or("")
+    };
+    if matches!(host_only, "127.0.0.1" | "localhost" | "::1") {
+        return true;
+    }
+
+    let supplied = headers
+        .get("x-ctm-origin-auth")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    constant_time_eq(expected.as_bytes(), supplied.as_bytes())
+}
+
+pub fn origin_forbidden_response() -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    (
+        axum::http::StatusCode::FORBIDDEN,
+        axum::Json(serde_json::json!({ "error": "relay_origin_proof_required" })),
+    )
+        .into_response()
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (a, b) in left.iter().zip(right.iter()) {
+        diff |= a ^ b;
+    }
+    diff == 0
+}
+
+pub async fn activate_lease(
+    profile: &WorkspaceProfile,
+    kind: TunnelServiceKind,
+    target: &str,
+) -> AppResult<()> {
+    if !relay_enabled(profile, kind) {
+        deactivate_lease_task(&profile.id, kind).await;
+        return Ok(());
+    }
+    if !is_valid_quick_target(target) {
+        return Err(AppError::Message(
+            "Relay 租约启动失败：当前 transport 不是合法的 Quick Tunnel 根地址。".into(),
+        ));
+    }
+
+    let profile = profile.clone();
+    let target = target.trim().trim_end_matches('/').to_string();
+    // Start/replace the renewal task even when this first network update fails; a
+    // transient Worker/DNS failure can then recover automatically without restarting
+    // the local service or Quick Tunnel.
+    let initial = sync_target(&profile, kind, &target).await;
+    let key = lease_key(&profile.id, kind);
+    let mut tasks = LEASE_TASKS.lock().await;
+    if let Some(previous) = tasks.remove(&key) {
+        previous.handle.abort();
+    }
+    let task_profile = profile.clone();
+    let task_target = target.clone();
+    let handle = tauri::async_runtime::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(RELAY_RENEW_SECONDS));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            if let Err(error) = sync_target(&task_profile, kind, &task_target).await {
+                crate::tunnel::append_profile_log(
+                    &task_profile.id,
+                    if kind == TunnelServiceKind::Mcp {
+                        "stderr.log"
+                    } else {
+                        "actions-stderr.log"
+                    },
+                    &format!("[relay] 续租失败：{error}"),
+                );
+            }
+        }
+    });
+    tasks.insert(key, LeaseTask { target, handle });
+    drop(tasks);
+    initial
+}
+
+pub async fn deactivate_lease(profile: &WorkspaceProfile, kind: TunnelServiceKind) {
+    deactivate_lease_task(&profile.id, kind).await;
+    if relay_configured(profile, kind) {
+        if let Err(error) = mark_offline(profile, kind).await {
+            crate::tunnel::append_profile_log(
+                &profile.id,
+                if kind == TunnelServiceKind::Mcp {
+                    "stderr.log"
+                } else {
+                    "actions-stderr.log"
+                },
+                &format!("[relay] 标记离线失败，将等待远端租约自然过期：{error}"),
+            );
+        }
+    }
+}
+
+pub async fn deactivate_lease_task(workspace_id: &str, kind: TunnelServiceKind) {
+    let key = lease_key(workspace_id, kind);
+    if let Some(task) = LEASE_TASKS.lock().await.remove(&key) {
+        task.handle.abort();
+    }
+}
+
+pub async fn active_lease_target(workspace_id: &str, kind: TunnelServiceKind) -> Option<String> {
+    LEASE_TASKS
+        .lock()
+        .await
+        .get(&lease_key(workspace_id, kind))
+        .map(|task| task.target.clone())
+}
+
+pub async fn shutdown_profiles(profiles: &[WorkspaceProfile]) {
+    for profile in profiles {
+        for kind in [TunnelServiceKind::Mcp, TunnelServiceKind::Actions] {
+            deactivate_lease_task(&profile.id, kind).await;
+            if relay_configured(profile, kind) {
+                let _ = mark_offline(profile, kind).await;
+            }
+        }
+    }
+}
+
+pub async fn deploy(
+    profile: &WorkspaceProfile,
+    kind: TunnelServiceKind,
+    account_id: &str,
+    api_token: &str,
+) -> AppResult<RelayDeploymentResult> {
+    validate_quick_relay_eligible(profile, kind)?;
+    validate_account_id(account_id)?;
+    if api_token.trim().len() < 20 {
+        return Err(AppError::Message("Cloudflare Account API Token 为空或格式异常。".into()));
+    }
+
+    let worker_name = {
+        let existing = relay_config(profile, kind).worker_name.trim();
