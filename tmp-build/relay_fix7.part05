@@ -1,0 +1,179 @@
++            actions_openapi_public_result.1, actions_public, actions_transport
++        );
++    }
+     items.push(public_health_item(
+         "公网 Actions /openapi.json",
+         actions_openapi_public_result.0,
+         actions_openapi_public_result.1,
+-        "当前实时隧道存在，但公网 OpenAPI 响应异常；servers 必须指向当前实时 Tunnel URL。",
++        "公网 OpenAPI 响应异常；servers 必须指向当前对外 canonical origin，Relay 模式下应为稳定 workers.dev 地址。",
+         actions_local_ok,
+         &actions_public,
+     ));
+@@ -687,7 +794,7 @@ pub async fn run_health_checks(
+             "Actions OAuth 授权元数据",
+             actions_oauth_result.0,
+             actions_oauth_result.1,
+-            "Actions OAuth 元数据必须与当前实时 Tunnel URL 一致。",
++            "Actions OAuth 元数据必须与当前对外 canonical origin 一致；Relay 模式下应为稳定 workers.dev 地址。",
+             actions_local_ok,
+             &actions_public,
+         ));
+diff --git a/src-tauri/src/lib.rs b/src-tauri/src/lib.rs
+index 43c6d74..50e221e 100644
+--- a/src-tauri/src/lib.rs
++++ b/src-tauri/src/lib.rs
+@@ -10,6 +10,7 @@ pub mod harness;
+ mod health;
+ mod mcp;
+ mod platform;
++mod relay;
+ mod runtime;
+ mod secret;
+ mod settings;
+@@ -20,6 +21,8 @@ mod workspace;
+ 
+ use app_state::AppState;
+ use commands::{
++    delete_cloudflare_relay, deploy_cloudflare_relay, get_cloudflare_relay_status,
++    sync_cloudflare_relay,
+     check_app_update, create_workspace, delete_frp_profile, delete_workspace,
+     get_actions_runtime_status, get_app_settings, get_download_config, get_frp_snippet,
+     get_last_workspace_id, get_proxy, get_runtime_status, get_shared_secret, get_webview_memory_sample,
+@@ -125,8 +128,13 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
+                 let _ = commands::window_chrome::show_main_window(app.clone());
+             }
+             "quit" => {
+-                commands::window_chrome::arm_allow_exit();
+-                app.exit(0);
++                let app = app.clone();
++                tauri::async_runtime::spawn(async move {
++                    let state = app.state::<AppState>();
++                    commands::window_chrome::best_effort_relay_shutdown(&state).await;
++                    commands::window_chrome::arm_allow_exit();
++                    app.exit(0);
++                });
+             }
+             _ => {}
+         })
+@@ -188,6 +196,10 @@ pub fn run() {
+             start_tunnel,
+             stop_tunnel,
+             run_health_checks,
++            deploy_cloudflare_relay,
++            get_cloudflare_relay_status,
++            sync_cloudflare_relay,
++            delete_cloudflare_relay,
+             get_workspace_secret,
+             set_workspace_secret,
+             regenerate_workspace_secret,
+diff --git a/src-tauri/src/mcp/listener.rs b/src-tauri/src/mcp/listener.rs
+index f3f271f..3bcb5e6 100644
+--- a/src-tauri/src/mcp/listener.rs
++++ b/src-tauri/src/mcp/listener.rs
+@@ -35,6 +35,7 @@ struct ListenerState {
+     bearer_token: Option<String>,
+     oauth: Option<Arc<OAuthRuntime>>,
+     oauth_client_secret: Option<String>,
++    relay_origin_auth: Option<String>,
+ }
+ 
+ #[allow(clippy::too_many_arguments)]
+@@ -47,6 +48,7 @@ pub fn spawn_listener(
+     oauth_client_secret: Option<String>,
+     oauth_password: Option<String>,
+     oauth_token_secret: Option<String>,
++    relay_origin_auth: Option<String>,
+     runtime: RuntimeConfig,
+ ) -> Result<(ShutdownSender, tauri::async_runtime::JoinHandle<()>), String> {
+     let workspace_display = workspace_path.display().to_string();
+@@ -98,6 +100,7 @@ pub fn spawn_listener(
+         bearer_token,
+         oauth,
+         oauth_client_secret,
++        relay_origin_auth,
+     };
+     // 在返回 Running 之前完成 bind，避免后台任务里的端口冲突被伪装成启动成功。
+     let listener = bind_listener(port)?;
+@@ -165,7 +168,13 @@ fn bind_listener(port: u16) -> Result<tokio::net::TcpListener, String> {
+         .map_err(|err| format!("MCP 本地监听器初始化失败: {err}"))
+ }
+ 
+-async fn mcp_discovery() -> Response {
++async fn mcp_discovery(
++    State(state): State<ListenerState>,
++    headers: HeaderMap,
++) -> Response {
++    if let Some(response) = require_relay_origin(&state, &headers) {
++        return response;
++    }
+     ([(CACHE_CONTROL, "no-store")], Json(mcp_discovery_payload())).into_response()
+ }
+ 
+@@ -181,11 +190,22 @@ fn resolve_oauth_base(state: &ListenerState, headers: &HeaderMap) -> String {
+     external_base_url(headers, state.bind_port, &state.configured_public_url)
+ }
+ 
++fn require_relay_origin(state: &ListenerState, headers: &HeaderMap) -> Option<Response> {
++    if crate::relay::request_has_valid_origin_proof(headers, state.relay_origin_auth.as_deref()) {
++        None
++    } else {
++        Some(crate::relay::origin_forbidden_response())
++    }
++}
++
+ async fn mcp_post(
+     State(state): State<ListenerState>,
+     headers: HeaderMap,
+     Json(body): Json<Value>,
+ ) -> Response {
++    if let Some(response) = require_relay_origin(&state, &headers) {
++        return response;
++    }
+     if let Some(response) = require_mcp_auth(&state, &headers) {
+         return response;
+     }
+@@ -298,6 +318,9 @@ async fn oauth_authorization_server_metadata(
+     State(state): State<ListenerState>,
+     headers: HeaderMap,
+ ) -> Response {
++    if let Some(response) = require_relay_origin(&state, &headers) {
++        return response;
++    }
+     if !state.auth.oauth_enabled() {
+         return oauth_not_configured();
+     }
+@@ -313,6 +336,9 @@ async fn oauth_protected_resource_metadata(
+     State(state): State<ListenerState>,
+     headers: HeaderMap,
+ ) -> Response {
++    if let Some(response) = require_relay_origin(&state, &headers) {
++        return response;
++    }
+     if !state.auth.oauth_enabled() {
+         return oauth_not_configured();
+     }
+@@ -321,8 +347,12 @@ async fn oauth_protected_resource_metadata(
+ 
+ async fn oauth_authorize_get(
+     State(state): State<ListenerState>,
++    headers: HeaderMap,
+     Query(params): Query<AuthorizeParams>,
+ ) -> Response {
++    if let Some(response) = require_relay_origin(&state, &headers) {
++        return response;
++    }
+     let Some(oauth) = state.oauth.as_ref() else {
+         return oauth_not_configured();
+     };
+@@ -338,6 +368,9 @@ async fn oauth_authorize_post(
+     headers: HeaderMap,
+     Form(form): Form<AuthorizeForm>,
+ ) -> Response {
++    if let Some(response) = require_relay_origin(&state, &headers) {
++        return response;
++    }
+     let Some(oauth) = state.oauth.as_ref() else {
+         return oauth_not_configured();
+     };
+@@ -349,6 +382,9 @@ async fn oauth_token_post(
