@@ -139,7 +139,8 @@ jobs:
             headers: { 'content-type': 'application/json' },
           });
           const stub = { fetch: async (request) => {
-            const url = new URL(request.url);
+            const rawUrl = typeof request === 'string' ? request : request.url;
+            const url = new URL(rawUrl);
             if (url.pathname === '/resolve') return json({ online: false });
             if (url.pathname === '/update') return json({ ok: true });
             return new Response(null, { status: 404 });
