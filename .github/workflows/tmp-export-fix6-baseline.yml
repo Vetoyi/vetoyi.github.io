@@ -45,10 +45,16 @@ jobs:
           python fix5_delta.py
 
       - name: Apply fix6 lifecycle and diagnostics delta
-        run: python tmp-build/fix6_delta.py
-
-      - name: Apply fix6 cleanup delta
-        run: python tmp-build/fix6_cleanup.py
+        run: |
+          # fix6 was authored on the Windows build path; normalize the actual upstream route name for portable replay.
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('tmp-build/fix6_delta.py')
+          s = p.read_text(encoding='utf-8').replace('src/routes/workspaces/[id]/+page.svelte','src/routes/workspace/[id]/+page.svelte')
+          p.write_text(s, encoding='utf-8', newline='\n')
+          PY
+          python tmp-build/fix6_delta.py
+          python tmp-build/fix6_cleanup.py
 
       - name: Archive exact baseline
         shell: bash
