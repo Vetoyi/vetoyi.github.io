@@ -77,8 +77,8 @@ jobs:
           [IO.File]::WriteAllText('relay_fix7.patch', $content, [Text.UTF8Encoding]::new($false))
           Push-Location app
           git init | Out-Null
-          git apply --check ../relay_fix7.patch
-          git apply ../relay_fix7.patch
+          git apply --check --ignore-space-change --ignore-whitespace ../relay_fix7.patch
+          git apply --ignore-space-change --ignore-whitespace ../relay_fix7.patch
           Pop-Location
 
       - name: Install fix7 new source files
