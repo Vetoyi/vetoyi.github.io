@@ -1,0 +1,132 @@
+name: Temporary Coding Tools MCP Fix6 Build
+
+on:
+  push:
+    branches:
+      - tmp-build-coding-tools-mcp-fix6
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout temporary build helpers
+        uses: actions/checkout@v4
+
+      - name: Prepare v0.2.0 source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Invoke-WebRequest -Uri 'https://github.com/mybolide/coding-tools-mcp/archive/4384593b85b66ba5b5f229e19657780c6f6386f6.zip' -OutFile source.zip
+          Expand-Archive source.zip -DestinationPath src
+          $dir = Get-ChildItem src -Directory | Select-Object -First 1
+          Move-Item $dir.FullName app
+
+      - name: Apply validated fix2 base
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/Vetoyi/vetoyi.github.io/10722ad45c61848b41ff5dcb9f3f2e6247a2e567/tmp-build/fix2_apply.py' -OutFile fix2_apply.py
+          python fix2_apply.py
+
+      - name: Apply validated fix3 deltas
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/Vetoyi/vetoyi.github.io/6702bcfd0a75c3a33468629de52b72d806eb9866/tmp-build/fix3_delta.py' -OutFile fix3_delta.py
+          python fix3_delta.py
+
+      - name: Apply validated fix4 local OpenAPI origin delta
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/Vetoyi/vetoyi.github.io/5c3124e240ac0846175311e54e4c91ad2cee4496/tmp-build/fix4_delta.py' -OutFile fix4_delta.py
+          python fix4_delta.py
+
+      - name: Apply validated fix5 registered-connection gate
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/Vetoyi/vetoyi.github.io/af26b5eab9c842be8415f7910faa3fc05cc32cc1/tmp-build/fix5_delta.py' -OutFile fix5_delta.py
+          python fix5_delta.py
+
+      - name: Apply fix6 lifecycle and diagnostics delta
+        run: python tmp-build/fix6_delta.py
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app/src-tauri
+
+      - name: Install dependencies
+        working-directory: app
+        run: npm ci
+
+      - name: Frontend check
+        working-directory: app
+        run: npm run check
+
+      - name: MCP OAuth regression tests
+        working-directory: app/src-tauri
+        run: |
+          cargo test external_base_url_uses_current_host_for_stale_quick_tunnel
+          cargo test stale_quick_tunnel_does_not_trust_non_cloudflare_host
+
+      - name: Actions request-origin regression tests
+        working-directory: app/src-tauri
+        run: |
+          cargo test openapi_server_is_rewritten_to_current_request_origin
+          cargo test openapi_base_uses_local_request_origin_for_localhost
+          cargo test openapi_base_uses_current_public_request_origin
+
+      - name: Quick Tunnel readiness and rate-limit tests
+        working-directory: app/src-tauri
+        run: |
+          cargo test quick_tunnel_url_alone_is_not_ready
+          cargo test quick_tunnel_becomes_ready_after_registered_connection
+          cargo test unrelated_cloudflared_log_line_does_not_register_connection
+          cargo test detects_cloudflare_1015_rate_limit_line
+          cargo test detects_plain_429_rate_limit_line
+          cargo test normal_registered_line_is_not_rate_limit
+
+      - name: Health checker regression tests
+        working-directory: app/src-tauri
+        run: |
+          cargo test normalizes_trailing_slash_for_oauth_origin_checks
+          cargo test identifies_quick_tunnel_urls
+          cargo test only_network_errors_are_downgraded_to_warning
+          cargo test service_not_listening_is_treated_as_not_running
+          cargo test openapi_server_must_match_current_origin
+          cargo test quick_cloudflare_is_detected_for_health_state
+          cargo test stopped_tunnel_message_mentions_rate_limit_when_cooling_down
+
+      - name: Full Rust tests
+        working-directory: app/src-tauri
+        run: cargo test
+
+      - name: Build Windows NSIS installer
+        working-directory: app
+        run: npm run tauri -- build --bundles nsis
+
+      - name: Rename installer
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem 'app/src-tauri/target/release/bundle/nsis/*.exe' | Select-Object -First 1
+          if (-not $exe) { throw 'NSIS installer not found' }
+          Copy-Item $exe.FullName 'Coding.Tools.MCP_0.2.0fix6_x64-setup.exe'
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: Coding.Tools.MCP_0.2.0fix6_x64-setup
+          path: Coding.Tools.MCP_0.2.0fix6_x64-setup.exe
+          if-no-files-found: error
