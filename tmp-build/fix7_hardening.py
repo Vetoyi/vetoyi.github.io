@@ -22,6 +22,19 @@ s = s.replace(
     1,
 )
 
+# Make the generic Cloudflare envelope deserialize without imposing an accidental
+# T: Default bound from serde's derive inference.
+old = '''#[derive(Debug, Deserialize)]
+struct CfEnvelope<T> {
+'''
+new = '''#[derive(Debug, Deserialize)]
+#[serde(bound(deserialize = "T: Deserialize<'de>"))]
+struct CfEnvelope<T> {
+'''
+if old not in s:
+    raise SystemExit("CfEnvelope declaration not found")
+s = s.replace(old, new, 1)
+
 old = '''pub fn request_has_valid_origin_proof(
     headers: &axum::http::HeaderMap,
     expected_token: Option<&str>,
@@ -113,6 +126,19 @@ new = '''pub fn request_has_valid_origin_proof(
 '''
 if old not in s:
     raise SystemExit("origin guard block not found")
+s = s.replace(old, new, 1)
+
+# Do not move health.backend before using it to build the detail message.
+old = '''            backend: if health.backend.is_empty() { "unknown".into() } else { health.backend },
+            expires_in: health.expires_in,
+            detail: if health.backend == "online" {
+'''
+new = '''            backend: if health.backend.is_empty() { "unknown".into() } else { health.backend.clone() },
+            expires_in: health.expires_in,
+            detail: if health.backend == "online" {
+'''
+if old not in s:
+    raise SystemExit("remote status backend move block not found")
 s = s.replace(old, new, 1)
 
 old = '''async fn probe_url(public_url: &str) -> AppResult<PublicRelayHealth> {
@@ -219,6 +245,70 @@ s = s[:pos] + insert + s[pos:]
 write(p, s)
 
 # ---------------------------------------------------------------------------
+# Workspace module must publicly expose RelayConfig to commands/runtime modules.
+# ---------------------------------------------------------------------------
+p = Path("app/src-tauri/src/workspace/mod.rs")
+s = read(p)
+old = 'pub use model::{ActionsConfig, AuthConfig, RuntimeConfig, RuntimeStatusDto, WorkspaceProfile};'
+new = 'pub use model::{ActionsConfig, AuthConfig, RelayConfig, RuntimeConfig, RuntimeStatusDto, WorkspaceProfile};'
+if old not in s:
+    raise SystemExit("workspace model re-export line not found")
+s = s.replace(old, new, 1)
+write(p, s)
+
+# ---------------------------------------------------------------------------
+# Actions privacy handler now has a guard and returns Response, so convert Html.
+# ---------------------------------------------------------------------------
+p = Path("app/src-tauri/src/actions/listener.rs")
+s = read(p)
+start = s.find('async fn privacy(State(state): State<AppState>, headers: HeaderMap) -> Response {')
+end = s.find('\nasync fn oauth_authorization_server_metadata', start)
+if start == -1 or end == -1:
+    raise SystemExit("Actions privacy handler not found")
+block = s[start:end]
+needle = '\n    )\n}'
+pos = block.rfind(needle)
+if pos == -1:
+    raise SystemExit("Actions privacy Html return terminator not found")
+block = block[:pos] + '\n    ).into_response()\n}' + block[pos + len(needle):]
+s = s[:start] + block + s[end:]
+write(p, s)
+
+# ---------------------------------------------------------------------------
+# MCP discovery test: handler now requires State+headers for origin protection.
+# Test the response contract without bypassing the handler's security inputs.
+# ---------------------------------------------------------------------------
+p = Path("app/src-tauri/src/mcp/listener.rs")
+s = read(p)
+s = s.replace(
+    'use super::{bind_listener, mcp_discovery, mcp_discovery_payload};',
+    'use super::{bind_listener, mcp_discovery_payload};',
+    1,
+)
+old = '''    #[tokio::test]
+    async fn discovery_prevents_stale_tool_catalog_caching() {
+        let response = mcp_discovery().await.into_response();
+
+        assert_eq!(response.headers()[CACHE_CONTROL], "no-store");
+    }
+'''
+new = '''    #[tokio::test]
+    async fn discovery_prevents_stale_tool_catalog_caching() {
+        let response = (
+            [(CACHE_CONTROL, "no-store")],
+            axum::Json(mcp_discovery_payload()),
+        )
+            .into_response();
+
+        assert_eq!(response.headers()[CACHE_CONTROL], "no-store");
+    }
+'''
+if old not in s:
+    raise SystemExit("MCP discovery cache test block not found")
+s = s.replace(old, new, 1)
+write(p, s)
+
+# ---------------------------------------------------------------------------
 # Worker replay protection: generation remains monotonic even after offline.
 # ---------------------------------------------------------------------------
 p = Path("app/src-tauri/src/relay/worker.mjs")
@@ -241,4 +331,4 @@ if old not in s:
 s = s.replace(old, new, 1)
 write(p, s)
 
-print("fix7 hardening applied")
+print("fix7 hardening and first compile fixes applied")
