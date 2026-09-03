@@ -81,9 +81,13 @@ pub async fn deploy_cloudflare_relay(
 ) -> AppResult<RelayDeploymentResult> {
     let kind = parse_kind(&service)?;
     let profile = profile_by_id(&state, &id)?;
+    let previous_canonical = match kind {
+        TunnelServiceKind::Mcp => profile.mcp_canonical_public_url(),
+        TunnelServiceKind::Actions => profile.actions_canonical_public_url(),
+    };
     let deploy_result = relay::deploy(&profile, kind, &account_id, &api_token).await;
     api_token.zeroize();
-    let result = deploy_result?;
+    let mut result = deploy_result?;
 
     let config = RelayConfig {
         enabled: true,
@@ -93,14 +97,21 @@ pub async fn deploy_cloudflare_relay(
         deployment_version: result.deployment_version,
     };
     let updated = set_relay_config(&state, &id, kind, config)?;
+    let next_canonical = match kind {
+        TunnelServiceKind::Mcp => updated.mcp_canonical_public_url(),
+        TunnelServiceKind::Actions => updated.actions_canonical_public_url(),
+    };
 
-    // A running listener was started with the previous canonical origin. Restart once
-    // after deployment so OAuth identity immediately switches to the stable Relay URL.
-    if let Err(error) = restart_if_running(&state, &id, kind).await {
-        return Err(AppError::Message(format!(
-            "Relay 已部署到 {}，但当前服务自动重启失败：{error}。Relay 配置已保存；请手动重新启动该服务一次。",
-            result.public_url
-        )));
+    // Only restart when the application identity actually changes. A normal Worker code
+    // upgrade keeps the same workers.dev URL and therefore must not churn the Quick Tunnel
+    // or consume another account-less Tunnel allocation.
+    if previous_canonical != next_canonical {
+        if let Err(error) = restart_if_running(&state, &id, kind).await {
+            return Err(AppError::Message(format!(
+                "Relay 已部署到 {}，但当前服务自动重启失败：{error}。Relay 配置已保存；请手动重新启动该服务一次。",
+                result.public_url
+            )));
+        }
     }
 
     // If the tunnel is managed independently from the local runtime, synchronize it too.
@@ -111,7 +122,11 @@ pub async fn deploy_cloudflare_relay(
     };
     if status.state == "running" && relay::is_valid_quick_target(&status.public_url) {
         let current = profile_by_id(&state, &id)?;
-        relay::activate_lease(&current, kind, &status.public_url).await?;
+        if let Err(error) = relay::activate_lease(&current, kind, &status.public_url).await {
+            result.message.push_str(&format!(
+                " 当前 Quick Tunnel 已运行，但 Relay 首次 target 同步失败：{error}。后台续租任务会自动重试，无需重启服务。"
+            ));
+        }
     }
 
     Ok(result)
