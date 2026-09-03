@@ -1,0 +1,169 @@
+@@ -377,3 +440,42 @@ fn computed_public_url(
+     }
+     public_url.trim_end_matches('/').to_string()
+ }
++
++
++#[cfg(test)]
++mod relay_model_tests {
++    use super::*;
++
++    #[test]
++    fn relay_is_canonical_but_quick_url_remains_transport() {
++        let mut profile = WorkspaceProfile::new("C:/repo".into(), Some("repo".into()));
++        profile.tunnel.tunnel_type = "cloudflare".into();
++        profile.tunnel.cloudflare_mode = "quick".into();
++        profile.tunnel.public_url = "https://random.trycloudflare.com".into();
++        profile.tunnel.relay = RelayConfig {
++            enabled: true,
++            public_url: "https://ctm-relay.example.workers.dev".into(),
++            ..RelayConfig::default()
++        };
++        assert_eq!(profile.effective_public_url(), "https://random.trycloudflare.com");
++        assert_eq!(profile.mcp_canonical_public_url(), "https://ctm-relay.example.workers.dev");
++        assert_eq!(profile.public_endpoint(), "https://ctm-relay.example.workers.dev/mcp");
++    }
++
++    #[test]
++    fn relay_never_overrides_named_or_non_cloudflare_tunnel() {
++        let mut profile = WorkspaceProfile::new("C:/repo".into(), Some("repo".into()));
++        profile.tunnel.relay = RelayConfig {
++            enabled: true,
++            public_url: "https://ctm-relay.example.workers.dev".into(),
++            ..RelayConfig::default()
++        };
++        profile.tunnel.tunnel_type = "frp".into();
++        profile.tunnel.public_url = "https://frp.example.com".into();
++        assert!(!profile.mcp_relay_enabled());
++        profile.tunnel.tunnel_type = "cloudflare".into();
++        profile.tunnel.cloudflare_mode = "named".into();
++        profile.tunnel.public_url = "https://named.example.com".into();
++        assert!(!profile.mcp_relay_enabled());
++    }
++}
+diff --git a/src/lib/types.ts b/src/lib/types.ts
+index 0ed5710..a378f8d 100644
+--- a/src/lib/types.ts
++++ b/src/lib/types.ts
+@@ -3,6 +3,14 @@ export type RuntimeState = "stopped" | "starting" | "running" | "stopping" | "er
+ export const DEFAULT_SERVICE_PORT = 28766;
+ export const DEFAULT_ACTIONS_PORT = 8787;
+ 
++export interface RelayConfig {
++  enabled: boolean;
++  account_id: string;
++  worker_name: string;
++  public_url: string;
++  deployment_version: number;
++}
++
+ export interface TunnelConfig {
+   type: string;
+   public_url: string;
+@@ -12,6 +20,7 @@ export interface TunnelConfig {
+   frp_server_port?: number;
+   cloudflare_mode: string;
+   use_proxy?: boolean;
++  relay?: RelayConfig;
+ }
+ 
+ export interface AuthConfig {
+@@ -40,6 +49,7 @@ export interface ActionsConfig {
+   cloudflare_mode: string;
+   cloudflare_token?: string;
+   use_proxy?: boolean;
++  relay?: RelayConfig;
+   local_port: number;
+   permission_mode: string;
+   runtime_command?: string;
+@@ -131,6 +141,14 @@ export function actionsPublicBaseUrl(
+   frpProfiles: FrpProfileSummary[] = [],
+ ): string {
+   const actions = actionsConfig(profile);
++  const relayUrl =
++    actions.tunnel_type === "cloudflare" &&
++    actions.cloudflare_mode !== "named" &&
++    actions.relay?.enabled
++      ? actions.relay.public_url?.replace(/\/$/, "")
++      : "";
++  if (relayUrl) return relayUrl;
++
+   const publicUrl = frpPublicUrl(
+     actions.tunnel_type,
+     actions.frp_subdomain,
+diff --git a/src/routes/workspace/[id]/+page.svelte b/src/routes/workspace/[id]/+page.svelte
+index 6addc3b..a9c2f8c 100644
+--- a/src/routes/workspace/[id]/+page.svelte
++++ b/src/routes/workspace/[id]/+page.svelte
+@@ -8,6 +8,7 @@
+   import AuthConfigForm from "$lib/components/AuthConfigForm.svelte";
+   import HealthPanel from "$lib/components/HealthPanel.svelte";
+   import LogViewer from "$lib/components/LogViewer.svelte";
++  import RelayConfigPanel from "$lib/components/RelayConfigPanel.svelte";
+   import RuntimePolicyForm, {
+     type RuntimePolicyDraft,
+   } from "$lib/components/RuntimePolicyForm.svelte";
+@@ -359,7 +360,13 @@
+     }
+     if (workspaceId !== targetWorkspaceId) return;
+     profile = next;
+-    mcpPublic = publicEndpointFromTunnel(config, "/mcp");
++    mcpPublic =
++      config.type === "cloudflare" &&
++      config.cloudflare_mode === "quick" &&
++      next.tunnel.relay?.enabled &&
++      next.tunnel.relay.public_url
++        ? `${next.tunnel.relay.public_url.replace(/\/$/, "")}/mcp`
++        : publicEndpointFromTunnel(config, "/mcp");
+     if (!options?.skipTunnelRestart && !options?.skipServicePrompt) {
+       await load();
+       if (workspaceId !== targetWorkspaceId) return;
+@@ -394,7 +401,13 @@
+     }
+     if (workspaceId !== targetWorkspaceId) return;
+     profile = next;
+-    actionsPublic = publicEndpointFromTunnel(config, "/openapi.json");
++    actionsPublic =
++      config.type === "cloudflare" &&
++      config.cloudflare_mode === "quick" &&
++      next.actions?.relay?.enabled &&
++      next.actions.relay.public_url
++        ? `${next.actions.relay.public_url.replace(/\/$/, "")}/openapi.json`
++        : publicEndpointFromTunnel(config, "/openapi.json");
+     if (!options?.skipTunnelRestart && !options?.skipServicePrompt) {
+       await load();
+       if (workspaceId !== targetWorkspaceId) return;
+@@ -636,6 +649,16 @@
+                 config={mcpTunnelForm}
+                 onSave={saveMcpTunnel}
+               />
++              {#if (profile.tunnel.type === "cloudflare" && profile.tunnel.cloudflare_mode === "quick") || profile.tunnel.relay?.enabled}
++                <div class="mt-4">
++                  <RelayConfigPanel
++                    workspaceId={workspaceId!}
++                    service="mcp"
++                    relay={profile.tunnel.relay}
++                    onChanged={async () => { await load(); }}
++                  />
++                </div>
++              {/if}
+             </div>
+             <div>
+               <p class="tx-section-label">认证</p>
+@@ -711,6 +734,16 @@
+                 config={actionsTunnelForm}
+                 onSave={saveActionsTunnel}
+               />
++              {#if (actions.tunnel_type === "cloudflare" && actions.cloudflare_mode === "quick") || actions.relay?.enabled}
++                <div class="mt-4">
++                  <RelayConfigPanel
++                    workspaceId={workspaceId!}
++                    service="actions"
++                    relay={actions.relay}
++                    onChanged={async () => { await load(); }}
++                  />
++                </div>
++              {/if}
+             </div>
+             <div>
+               <p class="tx-section-label">认证</p>
