@@ -1,0 +1,191 @@
+     headers: HeaderMap,
+     Form(form): Form<TokenForm>,
+ ) -> Response {
++    if let Some(response) = require_relay_origin(&state, &headers) {
++        return response;
++    }
+     let Some(oauth) = state.oauth.as_ref() else {
+         return (
+             StatusCode::BAD_REQUEST,
+diff --git a/src-tauri/src/runtime/supervisor.rs b/src-tauri/src/runtime/supervisor.rs
+index 063f116..8fc50ff 100644
+--- a/src-tauri/src/runtime/supervisor.rs
++++ b/src-tauri/src/runtime/supervisor.rs
+@@ -269,15 +269,18 @@ impl RuntimeSupervisor {
+                 } else {
+                     None
+                 };
++                let relay_origin_auth =
++                    crate::relay::origin_auth_for(profile, TunnelServiceKind::Mcp)?;
+                 mcp::spawn_listener(
+                     port,
+                     PathBuf::from(&profile.path),
+                     profile.id.clone(),
+                     auth,
+-                    profile.effective_public_url(),
++                    profile.mcp_canonical_public_url(),
+                     oauth_client_secret,
+                     oauth_password,
+                     oauth_token_secret,
++                    relay_origin_auth,
+                     profile.runtime.clone(),
+                 )
+             }
+@@ -327,7 +330,9 @@ impl RuntimeSupervisor {
+                 // has produced its URL, which freezes OAuth metadata to 127.0.0.1:8787.
+                 // An empty value is intentional on the first Quick Tunnel start: request
+                 // Host/X-Forwarded-Host will provide the current public origin dynamically.
+-                let public_base_url = profile.actions_effective_public_url();
++                let public_base_url = profile.actions_canonical_public_url();
++                let relay_origin_auth =
++                    crate::relay::origin_auth_for(profile, TunnelServiceKind::Actions)?;
+                 let policy = PolicySettings::from_actions_config(&profile.actions);
+                 actions::spawn_listener(
+                     &profile.id,
+@@ -340,6 +345,7 @@ impl RuntimeSupervisor {
+                     oauth_client_secret,
+                     oauth_password,
+                     oauth_token_secret,
++                    relay_origin_auth,
+                     policy,
+                 )
+             }
+@@ -539,8 +545,8 @@ fn endpoints(profile: &WorkspaceProfile, kind: ServiceKind) -> (String, String)
+ 
+ fn public_message_for(profile: &WorkspaceProfile, kind: ServiceKind) -> String {
+     match kind {
+-        ServiceKind::Mcp => profile.effective_public_url(),
+-        ServiceKind::Actions => profile.actions_effective_public_url(),
++        ServiceKind::Mcp => profile.mcp_canonical_public_url(),
++        ServiceKind::Actions => profile.actions_canonical_public_url(),
+     }
+ }
+ 
+diff --git a/src-tauri/src/workspace/model.rs b/src-tauri/src/workspace/model.rs
+index 80ce305..814952e 100644
+--- a/src-tauri/src/workspace/model.rs
++++ b/src-tauri/src/workspace/model.rs
+@@ -33,6 +33,23 @@ pub struct TunnelConfig {
+     /// When true, apply global proxy from Settings → General when starting the tunnel.
+     #[serde(default = "default_use_proxy")]
+     pub use_proxy: bool,
++    /// Optional stable Cloudflare Worker relay used only with account-less Quick Tunnels.
++    #[serde(default)]
++    pub relay: RelayConfig,
++}
++
++#[derive(Debug, Clone, Serialize, Deserialize, Default)]
++pub struct RelayConfig {
++    #[serde(default)]
++    pub enabled: bool,
++    #[serde(default)]
++    pub account_id: String,
++    #[serde(default)]
++    pub worker_name: String,
++    #[serde(default)]
++    pub public_url: String,
++    #[serde(default)]
++    pub deployment_version: u32,
+ }
+ 
+ #[derive(Debug, Clone, Serialize, Deserialize)]
+@@ -102,6 +119,9 @@ pub struct ActionsConfig {
+     pub max_patch_bytes: u32,
+     #[serde(default)]
+     pub use_shared_secrets: bool,
++    /// Optional stable Cloudflare Worker relay used only with account-less Quick Tunnels.
++    #[serde(default)]
++    pub relay: RelayConfig,
+ }
+ 
+ #[derive(Debug, Clone, Serialize, Deserialize)]
+@@ -193,6 +213,7 @@ impl Default for TunnelConfig {
+             frp_server_port: default_frp_server_port(),
+             cloudflare_mode: default_cloudflare_mode(),
+             use_proxy: default_use_proxy(),
++            relay: RelayConfig::default(),
+         }
+     }
+ }
+@@ -242,6 +263,7 @@ impl Default for ActionsConfig {
+             allowed_commands: default_allowed_commands(),
+             max_patch_bytes: default_max_patch_bytes(),
+             use_shared_secrets: false,
++            relay: RelayConfig::default(),
+         }
+     }
+ }
+@@ -288,8 +310,26 @@ impl WorkspaceProfile {
+         )
+     }
+ 
++    pub fn mcp_relay_enabled(&self) -> bool {
++        relay_active(
++            &self.tunnel.relay,
++            &self.tunnel.tunnel_type,
++            &self.tunnel.cloudflare_mode,
++        )
++    }
++
++    /// Stable application identity exposed to ChatGPT. The Quick Tunnel URL remains
++    /// the transport address and is intentionally kept separate.
++    pub fn mcp_canonical_public_url(&self) -> String {
++        if self.mcp_relay_enabled() {
++            self.tunnel.relay.public_url.trim_end_matches('/').to_string()
++        } else {
++            self.effective_public_url()
++        }
++    }
++
+     pub fn public_endpoint(&self) -> String {
+-        let base = self.effective_public_url();
++        let base = self.mcp_canonical_public_url();
+         if base.is_empty() {
+             return String::new();
+         }
+@@ -315,6 +355,22 @@ impl WorkspaceProfile {
+         )
+     }
+ 
++    pub fn actions_relay_enabled(&self) -> bool {
++        relay_active(
++            &self.actions.relay,
++            &self.actions.tunnel_type,
++            &self.actions.cloudflare_mode,
++        )
++    }
++
++    pub fn actions_canonical_public_url(&self) -> String {
++        if self.actions_relay_enabled() {
++            self.actions.relay.public_url.trim_end_matches('/').to_string()
++        } else {
++            self.actions_effective_public_url()
++        }
++    }
++
+     pub fn actions_openapi_url(&self) -> String {
+         let base = self.actions_public_base_url();
+         if base.is_empty() {
+@@ -349,7 +405,7 @@ impl WorkspaceProfile {
+ 
+     /// Public URL for GPT schema import; falls back to localhost when no tunnel is configured.
+     pub fn actions_public_base_url(&self) -> String {
+-        let public = self.actions_effective_public_url();
++        let public = self.actions_canonical_public_url();
+         if public.is_empty() {
+             self.actions_local_base_url()
+         } else {
+@@ -358,6 +414,13 @@ impl WorkspaceProfile {
+     }
+ }
+ 
++fn relay_active(relay: &RelayConfig, tunnel_type: &str, cloudflare_mode: &str) -> bool {
++    relay.enabled
++        && !relay.public_url.trim().is_empty()
++        && tunnel_type == "cloudflare"
++        && cloudflare_mode != "named"
++}
++
+ fn computed_public_url(
+     tunnel_type: &str,
+     frp_server: &str,
