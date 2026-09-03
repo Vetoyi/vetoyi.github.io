@@ -1,0 +1,172 @@
+diff --git a/src-tauri/Cargo.toml b/src-tauri/Cargo.toml
+index 5e351ae..1edaa56 100644
+--- a/src-tauri/Cargo.toml
++++ b/src-tauri/Cargo.toml
+@@ -23,7 +23,7 @@ dirs = "6"
+ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "process", "io-util", "fs", "time"] }
+ axum = { version = "0.8", features = ["form"] }
+ tower-http = { version = "0.6", features = ["cors"] }
+-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
++reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "multipart"] }
+ walkdir = "2"
+ regex = "1"
+ glob = "0.3"
+@@ -31,6 +31,9 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
+ base64 = "0.22"
+ jsonwebtoken = "9"
+ sha2 = "0.10"
++ed25519-dalek = { version = "2", features = ["rand_core"] }
++rand_core = { version = "0.6", features = ["getrandom"] }
++zeroize = "1"
+ shlex = "1"
+ shell-words = "1"
+ which = "7"
+@@ -43,6 +46,7 @@ fs2 = "0.4"
+ tempfile = "3"
+ 
+ [target.'cfg(windows)'.dependencies]
++keyring = { version = "3.6", features = ["windows-native"] }
+ windows = { version = "0.61", features = [
+     "Win32_Foundation",
+     "Win32_NetworkManagement_IpHelper",
+diff --git a/src-tauri/src/actions/listener.rs b/src-tauri/src/actions/listener.rs
+index cd50151..1296598 100644
+--- a/src-tauri/src/actions/listener.rs
++++ b/src-tauri/src/actions/listener.rs
+@@ -36,6 +36,7 @@ struct AppState {
+     configured_public_url: String,
+     oauth: Option<Arc<OAuthRuntime>>,
+     oauth_client_secret: Option<String>,
++    relay_origin_auth: Option<String>,
+     write_lock: Arc<Mutex<()>>,
+ }
+ 
+@@ -51,6 +52,7 @@ pub fn spawn_listener(
+     oauth_client_secret: Option<String>,
+     oauth_password: Option<String>,
+     oauth_token_secret: Option<String>,
++    relay_origin_auth: Option<String>,
+     policy: PolicySettings,
+ ) -> Result<(ShutdownSender, tauri::async_runtime::JoinHandle<()>), String> {
+     if auth_type == "api_key" && api_key.as_ref().is_none_or(String::is_empty) {
+@@ -98,6 +100,7 @@ pub fn spawn_listener(
+             api_key,
+             oauth,
+             oauth_client_secret,
++            relay_origin_auth,
+             policy,
+             shutdown_rx,
+         )
+@@ -131,6 +134,7 @@ async fn serve(
+     api_key: Option<String>,
+     oauth: Option<Arc<OAuthRuntime>>,
+     oauth_client_secret: Option<String>,
++    relay_origin_auth: Option<String>,
+     policy: PolicySettings,
+     shutdown: oneshot::Receiver<()>,
+ ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+@@ -178,6 +182,7 @@ async fn serve(
+         configured_public_url,
+         oauth,
+         oauth_client_secret,
++        relay_origin_auth,
+         write_lock: Arc::new(Mutex::new(())),
+     };
+ 
+@@ -226,7 +231,18 @@ fn bind_listener(port: u16) -> Result<tokio::net::TcpListener, String> {
+         .map_err(|err| format!("Actions 本地监听器初始化失败: {err}"))
+ }
+ 
+-async fn health(State(state): State<AppState>) -> Json<Value> {
++fn require_relay_origin(state: &AppState, headers: &HeaderMap) -> Option<Response> {
++    if crate::relay::request_has_valid_origin_proof(headers, state.relay_origin_auth.as_deref()) {
++        None
++    } else {
++        Some(crate::relay::origin_forbidden_response())
++    }
++}
++
++async fn health(State(state): State<AppState>, headers: HeaderMap) -> Response {
++    if let Some(response) = require_relay_origin(&state, &headers) {
++        return response;
++    }
+     let tools_loaded = state
+         .openapi
+         .read()
+@@ -243,9 +259,13 @@ async fn health(State(state): State<AppState>) -> Json<Value> {
+         "auth_type": state.auth.auth_type,
+         "tools_loaded": tools_loaded
+     }))
++    .into_response()
+ }
+ 
+-async fn openapi_json(State(state): State<AppState>, headers: HeaderMap) -> Json<Value> {
++async fn openapi_json(State(state): State<AppState>, headers: HeaderMap) -> Response {
++    if let Some(response) = require_relay_origin(&state, &headers) {
++        return response;
++    }
+     let mut document = state.openapi.read().await.clone();
+     // OpenAPI must describe the origin of THIS request. Do not reuse the OAuth
+     // origin resolver here: OAuth intentionally keeps a configured Quick Tunnel
+@@ -253,7 +273,7 @@ async fn openapi_json(State(state): State<AppState>, headers: HeaderMap) -> Json
+     // local origin to local callers and the public origin to tunnel callers.
+     let request_base = resolve_openapi_base(&headers, state.bind_port);
+     set_openapi_server(&mut document, &request_base);
+-    Json(document)
++    Json(document).into_response()
+ }
+ 
+ fn resolve_openapi_base(headers: &HeaderMap, bind_port: u16) -> String {
+@@ -264,7 +284,10 @@ fn set_openapi_server(document: &mut Value, public_base: &str) {
+     document["servers"] = json!([{ "url": public_base.trim_end_matches('/') }]);
+ }
+ 
+-async fn privacy() -> Html<&'static str> {
++async fn privacy(State(state): State<AppState>, headers: HeaderMap) -> Response {
++    if let Some(response) = require_relay_origin(&state, &headers) {
++        return response;
++    }
+     Html(
+         r#"<!doctype html>
+ <html lang="zh-CN">
+@@ -291,6 +314,9 @@ async fn oauth_authorization_server_metadata(
+     State(state): State<AppState>,
+     headers: HeaderMap,
+ ) -> Response {
++    if let Some(response) = require_relay_origin(&state, &headers) {
++        return response;
++    }
+     if !state.auth.oauth_enabled() {
+         return oauth_not_configured();
+     }
+@@ -303,8 +329,12 @@ async fn oauth_authorization_server_metadata(
+ 
+ async fn oauth_authorize_get(
+     State(state): State<AppState>,
++    headers: HeaderMap,
+     Query(params): Query<AuthorizeParams>,
+ ) -> Response {
++    if let Some(response) = require_relay_origin(&state, &headers) {
++        return response;
++    }
+     let Some(oauth) = state.oauth.as_ref() else {
+         return oauth_not_configured();
+     };
+@@ -316,6 +346,9 @@ async fn oauth_authorize_post(
+     headers: HeaderMap,
+     Form(form): Form<AuthorizeForm>,
+ ) -> Response {
++    if let Some(response) = require_relay_origin(&state, &headers) {
++        return response;
++    }
+     let Some(oauth) = state.oauth.as_ref() else {
+         return oauth_not_configured();
+     };
+@@ -327,6 +360,9 @@ async fn oauth_token_post(
+     headers: HeaderMap,
+     Form(form): Form<TokenForm>,
+ ) -> Response {
++    if let Some(response) = require_relay_origin(&state, &headers) {
++        return response;
++    }
+     let Some(oauth) = state.oauth.as_ref() else {
