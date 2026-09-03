@@ -1,0 +1,259 @@
+    response: Result<reqwest::Response, reqwest::Error>,
+    operation: &str,
+) -> AppResult<T> {
+    let response = response.map_err(|e| AppError::Message(format!("{operation}请求失败: {e}")))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|e| AppError::Message(format!("读取 {operation} 响应失败: {e}")))?;
+    let parsed: CfEnvelope<T> = serde_json::from_str(&body).map_err(|e| {
+        AppError::Message(format!(
+            "{operation}返回非预期响应: HTTP {status}; {e}; {}",
+            summarize_cf_body(&body)
+        ))
+    })?;
+    if !status.is_success() || !parsed.success {
+        let mut parts = parsed
+            .errors
+            .iter()
+            .chain(parsed.messages.iter())
+            .filter(|item| !item.message.is_empty())
+            .map(|item| {
+                if item.code == 0 {
+                    item.message.clone()
+                } else {
+                    format!("{}: {}", item.code, item.message)
+                }
+            })
+            .collect::<Vec<_>>();
+        parts.dedup();
+        let detail = if parts.is_empty() {
+            summarize_cf_body(&body)
+        } else {
+            parts.join("; ")
+        };
+        return Err(AppError::Message(format!("{operation}失败: HTTP {status}; {detail}")));
+    }
+    parsed.result.ok_or_else(|| AppError::Message(format!("{operation}成功但响应缺少 result。")))
+}
+
+fn summarize_cf_body(body: &str) -> String {
+    let compact = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    compact.chars().take(400).collect()
+}
+
+fn validate_quick_relay_eligible(profile: &WorkspaceProfile, kind: TunnelServiceKind) -> AppResult<()> {
+    let (tunnel_type, mode) = match kind {
+        TunnelServiceKind::Mcp => (&profile.tunnel.tunnel_type, &profile.tunnel.cloudflare_mode),
+        TunnelServiceKind::Actions => (&profile.actions.tunnel_type, &profile.actions.cloudflare_mode),
+    };
+    if tunnel_type != "cloudflare" || mode == "named" {
+        return Err(AppError::Message(
+            "Quick Tunnel Relay 仅适用于 Cloudflare Quick Tunnel。".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_account_id(account_id: &str) -> AppResult<()> {
+    let value = account_id.trim();
+    if value.len() != 32 || !value.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(AppError::Message(
+            "Cloudflare Account ID 应为 32 位十六进制字符串。".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_worker_name(worker_name: &str) -> AppResult<()> {
+    if worker_name.is_empty()
+        || worker_name.len() > 63
+        || !worker_name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
+        return Err(AppError::Message("Relay Worker 名称格式无效。".into()));
+    }
+    Ok(())
+}
+
+fn unix_millis() -> AppResult<u64> {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| AppError::Message("系统时间早于 Unix epoch，无法签名 Relay 更新。".into()))?;
+    Ok(duration.as_millis().min(u128::from(u64::MAX)) as u64)
+}
+
+fn next_generation(now_ms: u64) -> u64 {
+    let mut previous = LAST_GENERATION.load(Ordering::Relaxed);
+    loop {
+        let next = now_ms.max(previous.saturating_add(1));
+        match LAST_GENERATION.compare_exchange_weak(previous, next, Ordering::SeqCst, Ordering::Relaxed) {
+            Ok(_) => return next,
+            Err(actual) => previous = actual,
+        }
+    }
+}
+
+fn hex_prefix(bytes: &[u8], count: usize) -> String {
+    use std::fmt::Write as _;
+    let mut value = String::new();
+    for byte in bytes {
+        let _ = write!(&mut value, "{byte:02x}");
+        if value.len() >= count {
+            value.truncate(count);
+            break;
+        }
+    }
+    value
+}
+
+fn credential_name(workspace_id: &str, kind: TunnelServiceKind, key: &str) -> String {
+    format!("{}:{}:{key}", workspace_id, service_name(kind))
+}
+
+#[cfg(target_os = "windows")]
+fn secure_get(workspace_id: &str, kind: TunnelServiceKind, key: &str) -> AppResult<Option<Vec<u8>>> {
+    let entry = keyring::Entry::new(SECURE_SERVICE, &credential_name(workspace_id, kind, key))
+        .map_err(|e| AppError::Message(format!("初始化 Windows 凭据管理器失败: {e}")))?;
+    match entry.get_secret() {
+        Ok(secret) => Ok(Some(secret)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(error) => Err(AppError::Message(format!("读取 Windows 凭据管理器失败: {error}"))),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn secure_set(workspace_id: &str, kind: TunnelServiceKind, key: &str, value: &[u8]) -> AppResult<()> {
+    let entry = keyring::Entry::new(SECURE_SERVICE, &credential_name(workspace_id, kind, key))
+        .map_err(|e| AppError::Message(format!("初始化 Windows 凭据管理器失败: {e}")))?;
+    entry
+        .set_secret(value)
+        .map_err(|e| AppError::Message(format!("写入 Windows 凭据管理器失败: {e}")))
+}
+
+#[cfg(target_os = "windows")]
+fn secure_delete(workspace_id: &str, kind: TunnelServiceKind, key: &str) -> AppResult<()> {
+    let entry = keyring::Entry::new(SECURE_SERVICE, &credential_name(workspace_id, kind, key))
+        .map_err(|e| AppError::Message(format!("初始化 Windows 凭据管理器失败: {e}")))?;
+    match entry.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(error) => Err(AppError::Message(format!("删除 Windows 凭据失败: {error}"))),
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn secure_get(_workspace_id: &str, _kind: TunnelServiceKind, _key: &str) -> AppResult<Option<Vec<u8>>> {
+    Err(AppError::Message(
+        "当前 Relay 安全凭据存储实现仅在 Windows 安装包中启用。".into(),
+    ))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn secure_set(_workspace_id: &str, _kind: TunnelServiceKind, _key: &str, _value: &[u8]) -> AppResult<()> {
+    Err(AppError::Message(
+        "当前 Relay 安全凭据存储实现仅在 Windows 安装包中启用。".into(),
+    ))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn secure_delete(_workspace_id: &str, _kind: TunnelServiceKind, _key: &str) -> AppResult<()> {
+    Ok(())
+}
+
+fn load_identity(workspace_id: &str, kind: TunnelServiceKind) -> AppResult<Option<RelayIdentity>> {
+    let Some(signing_bytes) = secure_get(workspace_id, kind, "ed25519")? else {
+        return Ok(None);
+    };
+    let Some(origin_bytes) = secure_get(workspace_id, kind, "origin-auth")? else {
+        return Ok(None);
+    };
+    if signing_bytes.len() != 32 {
+        return Err(AppError::Message("Relay Ed25519 私钥长度异常，请重新部署 Relay。".into()));
+    }
+    let signing_array: [u8; 32] = signing_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| AppError::Message("Relay Ed25519 私钥格式异常。".into()))?;
+    let origin_auth_token = String::from_utf8(origin_bytes)
+        .map_err(|_| AppError::Message("Relay Origin 凭据编码异常。".into()))?;
+    if origin_auth_token.len() < 32 {
+        return Err(AppError::Message("Relay Origin 凭据长度异常。".into()));
+    }
+    Ok(Some(RelayIdentity {
+        signing_key: SigningKey::from_bytes(&signing_array),
+        origin_auth_token,
+    }))
+}
+
+fn load_or_create_identity(workspace_id: &str, kind: TunnelServiceKind) -> AppResult<RelayIdentity> {
+    if let Some(identity) = load_identity(workspace_id, kind)? {
+        return Ok(identity);
+    }
+    let signing_key = SigningKey::generate(&mut OsRng);
+    let mut origin_raw = [0u8; 32];
+    OsRng.fill_bytes(&mut origin_raw);
+    let origin_auth_token = URL_SAFE_NO_PAD.encode(origin_raw);
+    secure_set(workspace_id, kind, "ed25519", &signing_key.to_bytes())?;
+    if let Err(error) = secure_set(
+        workspace_id,
+        kind,
+        "origin-auth",
+        origin_auth_token.as_bytes(),
+    ) {
+        let _ = secure_delete(workspace_id, kind, "ed25519");
+        return Err(error);
+    }
+    Ok(RelayIdentity {
+        signing_key,
+        origin_auth_token,
+    })
+}
+
+fn delete_identity(workspace_id: &str, kind: TunnelServiceKind) -> AppResult<()> {
+    secure_delete(workspace_id, kind, "ed25519")?;
+    secure_delete(workspace_id, kind, "origin-auth")?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn target_validation_only_accepts_quick_tunnel_root() {
+        assert!(is_valid_quick_target("https://abc-def.trycloudflare.com"));
+        assert!(is_valid_quick_target("https://abc-def.trycloudflare.com/"));
+        assert!(!is_valid_quick_target("http://abc.trycloudflare.com"));
+        assert!(!is_valid_quick_target("https://trycloudflare.com"));
+        assert!(!is_valid_quick_target("https://trycloudflare.com.attacker.example"));
+        assert!(!is_valid_quick_target("https://abc.trycloudflare.com/mcp"));
+        assert!(!is_valid_quick_target("https://user:pass@abc.trycloudflare.com"));
+        assert!(!is_valid_quick_target("https://127.0.0.1"));
+    }
+
+    #[test]
+    fn worker_names_are_generic_and_deterministic() {
+        let name = default_worker_name("0123456789abcdef0123456789abcdef", TunnelServiceKind::Mcp);
+        assert_eq!(name, "ctm-relay-mcp-0123456789abcdef");
+        assert!(!name.contains("vetoy"));
+    }
+
+    #[test]
+    fn canonical_signature_payload_is_stable() {
+        let payload = SignedUpdate {
+            service: "mcp",
+            target: "https://abc.trycloudflare.com",
+            offline: false,
+            generation: 123,
+            timestamp_ms: 456,
+            lease_seconds: 300,
+            nonce: "0123456789abcdef".into(),
+        };
+        assert_eq!(
+            canonical_update(&payload),
+            "ctm-relay-v1\nservice=mcp\ntarget=https://abc.trycloudflare.com\noffline=0\ngeneration=123\ntimestamp_ms=456\nlease_seconds=300\nnonce=0123456789abcdef"
+        );
+    }
+}
