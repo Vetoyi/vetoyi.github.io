@@ -1,0 +1,327 @@
+        if existing.is_empty() {
+            default_worker_name(&profile.id, kind)
+        } else {
+            validate_worker_name(existing)?;
+            existing.to_string()
+        }
+    };
+
+    let identity = load_or_create_identity(&profile.id, kind)?;
+    let public_key_b64 = URL_SAFE_NO_PAD.encode(identity.signing_key.verifying_key().as_bytes());
+    let client = cloudflare_client()?;
+    let subdomain: AccountSubdomain = cf_json(
+        client
+            .get(format!("{CLOUDFLARE_API_BASE}/accounts/{}/workers/subdomain", account_id.trim()))
+            .bearer_auth(api_token.trim())
+            .send()
+            .await,
+        "读取 workers.dev 子域",
+    )
+    .await?;
+    let account_subdomain = subdomain.subdomain.trim().to_ascii_lowercase();
+    if account_subdomain.is_empty()
+        || !account_subdomain
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
+        return Err(AppError::Message(
+            "Cloudflare 账号尚未初始化 workers.dev 子域，或 API 返回的子域格式异常。请先在 Workers & Pages 中完成 workers.dev 子域初始化。"
+                .into(),
+        ));
+    }
+
+    let metadata = json!({
+        "main_module": "main.mjs",
+        "compatibility_date": "2026-09-03",
+        "bindings": [
+            {
+                "type": "durable_object_namespace",
+                "name": "RELAY_STATE",
+                "class_name": "RelayState"
+            },
+            {
+                "type": "plain_text",
+                "name": "ADMIN_PUBLIC_KEY_B64",
+                "text": public_key_b64
+            },
+            {
+                "type": "plain_text",
+                "name": "SERVICE_KIND",
+                "text": service_name(kind)
+            },
+            {
+                "type": "secret_text",
+                "name": "ORIGIN_AUTH_TOKEN",
+                "text": identity.origin_auth_token
+            }
+        ],
+        "exports": {
+            "RelayState": {
+                "type": "durable-object",
+                "storage": "sqlite"
+            }
+        }
+    });
+
+    let form = Form::new()
+        .part(
+            "metadata",
+            Part::text(metadata.to_string())
+                .mime_str("application/json")
+                .map_err(|e| AppError::Message(format!("创建 Worker metadata 失败: {e}")))?,
+        )
+        .part(
+            "main.mjs",
+            Part::bytes(WORKER_SOURCE.as_bytes().to_vec())
+                .file_name("main.mjs")
+                .mime_str("application/javascript+module")
+                .map_err(|e| AppError::Message(format!("创建 Worker module 失败: {e}")))?,
+        );
+
+    let _: Value = cf_json(
+        client
+            .put(format!(
+                "{CLOUDFLARE_API_BASE}/accounts/{}/workers/scripts/{worker_name}",
+                account_id.trim()
+            ))
+            .bearer_auth(api_token.trim())
+            .multipart(form)
+            .send()
+            .await,
+        "部署 Relay Worker",
+    )
+    .await?;
+
+    let subdomain_status: WorkerSubdomainStatus = cf_json(
+        client
+            .post(format!(
+                "{CLOUDFLARE_API_BASE}/accounts/{}/workers/scripts/{worker_name}/subdomain",
+                account_id.trim()
+            ))
+            .bearer_auth(api_token.trim())
+            .json(&json!({ "enabled": true, "previews_enabled": false }))
+            .send()
+            .await,
+        "启用 Relay workers.dev 地址",
+    )
+    .await?;
+    if !subdomain_status.enabled {
+        return Err(AppError::Message("Cloudflare 未能启用 Relay 的 workers.dev 地址。".into()));
+    }
+
+    let public_url = format!("https://{worker_name}.{account_subdomain}.workers.dev");
+    let health = probe_url(&public_url).await?;
+    if !health.ok || health.service != service_name(kind) || health.relay_version != "1" {
+        return Err(AppError::Message(format!(
+            "Relay 已部署但自检返回异常：service={}, version={}, backend={}",
+            health.service, health.relay_version, health.backend
+        )));
+    }
+
+    Ok(RelayDeploymentResult {
+        public_url,
+        worker_name,
+        account_id: account_id.trim().to_string(),
+        deployment_version: RELAY_DEPLOYMENT_VERSION,
+        message: "Cloudflare Quick Tunnel Relay 已部署；Cloudflare API Token 未保存。".into(),
+    })
+}
+
+pub async fn delete_remote(
+    profile: &WorkspaceProfile,
+    kind: TunnelServiceKind,
+    account_id: &str,
+    api_token: &str,
+) -> AppResult<()> {
+    validate_account_id(account_id)?;
+    let worker_name = relay_config(profile, kind).worker_name.trim();
+    if worker_name.is_empty() {
+        return Ok(());
+    }
+    validate_worker_name(worker_name)?;
+    let client = cloudflare_client()?;
+    let response = client
+        .delete(format!(
+            "{CLOUDFLARE_API_BASE}/accounts/{}/workers/scripts/{worker_name}",
+            account_id.trim()
+        ))
+        .bearer_auth(api_token.trim())
+        .send()
+        .await
+        .map_err(|e| AppError::Message(format!("删除 Relay Worker 请求失败: {e}")))?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(AppError::Message(format!(
+            "删除 Relay Worker 失败: HTTP {status}; {}",
+            summarize_cf_body(&body)
+        )));
+    }
+    delete_identity(&profile.id, kind)?;
+    Ok(())
+}
+
+pub async fn sync_target(
+    profile: &WorkspaceProfile,
+    kind: TunnelServiceKind,
+    target: &str,
+) -> AppResult<()> {
+    if !relay_enabled(profile, kind) {
+        return Ok(());
+    }
+    if !is_valid_quick_target(target) {
+        return Err(AppError::Message(
+            "Relay 拒绝同步：当前目标不是合法的 https://*.trycloudflare.com Quick Tunnel 根地址。"
+                .into(),
+        ));
+    }
+    send_update(profile, kind, target.trim().trim_end_matches('/'), false).await
+}
+
+pub async fn mark_offline(profile: &WorkspaceProfile, kind: TunnelServiceKind) -> AppResult<()> {
+    if !relay_configured(profile, kind) {
+        return Ok(());
+    }
+    send_update(profile, kind, "", true).await
+}
+
+pub async fn remote_status(
+    profile: &WorkspaceProfile,
+    kind: TunnelServiceKind,
+) -> RelayRemoteStatus {
+    let public_url = relay_public_url(profile, kind);
+    if !relay_configured(profile, kind) || public_url.is_empty() {
+        return RelayRemoteStatus {
+            configured: false,
+            public_url,
+            state: "not_configured".into(),
+            backend: "unknown".into(),
+            expires_in: 0,
+            detail: "Relay 未配置。".into(),
+        };
+    }
+    match probe_url(&public_url).await {
+        Ok(health) if health.ok && health.service == service_name(kind) => RelayRemoteStatus {
+            configured: true,
+            public_url,
+            state: "reachable".into(),
+            backend: if health.backend.is_empty() { "unknown".into() } else { health.backend },
+            expires_in: health.expires_in,
+            detail: if health.backend == "online" {
+                format!("Relay 在线，Quick Tunnel 租约剩余约 {} 秒。", health.expires_in)
+            } else {
+                "Relay 在线，但当前 Quick Tunnel backend 离线。".into()
+            },
+        },
+        Ok(health) => RelayRemoteStatus {
+            configured: true,
+            public_url,
+            state: "invalid".into(),
+            backend: health.backend,
+            expires_in: health.expires_in,
+            detail: "Relay 地址可访问，但返回的服务身份或版本不匹配。".into(),
+        },
+        Err(error) => RelayRemoteStatus {
+            configured: true,
+            public_url,
+            state: "unreachable".into(),
+            backend: "unknown".into(),
+            expires_in: 0,
+            detail: format!("Relay 自检失败: {error}"),
+        },
+    }
+}
+
+async fn send_update(
+    profile: &WorkspaceProfile,
+    kind: TunnelServiceKind,
+    target: &str,
+    offline: bool,
+) -> AppResult<()> {
+    let identity = load_identity(&profile.id, kind)?.ok_or_else(|| {
+        AppError::Message("Relay 本机签名密钥缺失，请重新部署 Relay。".into())
+    })?;
+    let public_url = relay_public_url(profile, kind);
+    if public_url.is_empty() {
+        return Err(AppError::Message("Relay 稳定公网地址为空。".into()));
+    }
+    let timestamp_ms = unix_millis()?;
+    let generation = next_generation(timestamp_ms);
+    let nonce = uuid::Uuid::new_v4().simple().to_string();
+    let payload = SignedUpdate {
+        service: service_name(kind),
+        target,
+        offline,
+        generation,
+        timestamp_ms,
+        lease_seconds: RELAY_LEASE_SECONDS,
+        nonce,
+    };
+    let canonical = canonical_update(&payload);
+    let signature = identity.signing_key.sign(canonical.as_bytes());
+    let signature_b64 = URL_SAFE_NO_PAD.encode(signature.to_bytes());
+
+    let client = relay_client()?;
+    let response = client
+        .post(format!("{}/__ctm/update", public_url.trim_end_matches('/')))
+        .header("x-ctm-signature", signature_b64)
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|e| AppError::Message(format!("同步 Relay target 失败: {e}")))?;
+    if !response.status().is_success() {
+        let status = response.status();
+        return Err(AppError::Message(format!(
+            "同步 Relay target 被拒绝: HTTP {status}。若刚重新部署过 Relay，请确认本机系统时间正确；若签名密钥丢失，请用 Cloudflare API Token 重新部署。"
+        )));
+    }
+    Ok(())
+}
+
+fn canonical_update(payload: &SignedUpdate<'_>) -> String {
+    format!(
+        "ctm-relay-v1\nservice={}\ntarget={}\noffline={}\ngeneration={}\ntimestamp_ms={}\nlease_seconds={}\nnonce={}",
+        payload.service,
+        if payload.offline { "" } else { payload.target },
+        if payload.offline { "1" } else { "0" },
+        payload.generation,
+        payload.timestamp_ms,
+        payload.lease_seconds,
+        payload.nonce
+    )
+}
+
+async fn probe_url(public_url: &str) -> AppResult<PublicRelayHealth> {
+    let response = relay_client()?
+        .get(format!("{}/__ctm/health", public_url.trim_end_matches('/')))
+        .send()
+        .await
+        .map_err(|e| AppError::Message(format!("访问 Relay 健康端点失败: {e}")))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(AppError::Message(format!("Relay 健康端点返回 HTTP {status}")));
+    }
+    response
+        .json::<PublicRelayHealth>()
+        .await
+        .map_err(|e| AppError::Message(format!("Relay 健康响应格式错误: {e}")))
+}
+
+fn relay_client() -> AppResult<reqwest::Client> {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(8))
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|e| AppError::Message(format!("创建 Relay HTTP 客户端失败: {e}")))
+}
+
+fn cloudflare_client() -> AppResult<reqwest::Client> {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(40))
+        .user_agent("Coding-Tools-MCP-Relay/0.2.0")
+        .build()
+        .map_err(|e| AppError::Message(format!("创建 Cloudflare API 客户端失败: {e}")))
+}
+
+async fn cf_json<T: for<'de> Deserialize<'de>>(
