@@ -1,0 +1,165 @@
++    if relay::relay_enabled(profile, kind) && local_service_listening(profile, kind)? {
++        relay::activate_lease(profile, kind, public_url).await?;
++    }
++    Ok(())
++}
++
+ #[tauri::command]
+ pub fn get_frp_snippet(
+     state: State<'_, AppState>,
+@@ -166,6 +178,11 @@ pub async fn restart_tunnel(
+     sync_tunnel_routes_from_runtime(&state).await?;
+     let settings = state.with_settings(|store| Ok(store.settings()))?;
+ 
++    // A tunnel restart can switch away from Quick Tunnel entirely. Revoke the old
++    // Relay lease first so the stable endpoint never keeps forwarding to the previous
++    // random transport while the new route is being established.
++    relay::deactivate_lease(&profile, kind).await;
++
+     let result = {
+         let mut guard = supervisor().lock().await;
+         let was_running = guard.status(&profile, kind, &settings).state == "running";
+@@ -205,11 +222,14 @@ pub async fn restart_tunnel(
+             if is_quick_cloudflare(&profile, kind) {
+                 let _ = persist_public_url(&state, &id, kind, "");
+             }
++            relay::deactivate_lease(&profile, kind).await;
+             return Err(error);
+         }
+     };
+ 
+     persist_public_url(&state, &id, kind, &status.public_url)?;
++    let current = profile_by_id(&state, &id)?;
++    activate_relay_if_service_is_live(&current, kind, &status.public_url).await?;
+     Ok(status)
+ }
+ 
+@@ -236,11 +256,14 @@ pub async fn start_tunnel(
+             if is_quick_cloudflare(&profile, kind) {
+                 let _ = persist_public_url(&state, &id, kind, "");
+             }
++            relay::deactivate_lease(&profile, kind).await;
+             return Err(error);
+         }
+     };
+ 
+     persist_public_url(&state, &id, kind, &status.public_url)?;
++    let current = profile_by_id(&state, &id)?;
++    activate_relay_if_service_is_live(&current, kind, &status.public_url).await?;
+     Ok(status)
+ }
+ 
+@@ -257,6 +280,7 @@ pub async fn stop_tunnel(
+     guard.stop(&profile, kind, &settings).await?;
+     let mut status = guard.status(&profile, kind, &settings);
+     drop(guard);
++    relay::deactivate_lease(&profile, kind).await;
+     if is_quick_cloudflare(&profile, kind) {
+         persist_public_url(&state, &id, kind, "")?;
+         status.public_url.clear();
+@@ -347,6 +371,8 @@ pub async fn test_tunnel(
+ 
+     if keep_tunnel {
+         persist_public_url(&state, &id, kind, &public_url)?;
++        let current = profile_by_id(&state, &id)?;
++        activate_relay_if_service_is_live(&current, kind, &public_url).await?;
+         return Ok(TunnelTestResult {
+             success: !public_url.is_empty() || status.state == "running",
+             public_url,
+@@ -363,6 +389,7 @@ pub async fn test_tunnel(
+         let mut guard = supervisor().lock().await;
+         guard.stop(&profile, kind, &settings).await?;
+     }
++    relay::deactivate_lease(&profile, kind).await;
+ 
+     let success = !public_url.is_empty();
+     let message = if public_url.is_empty() {
+diff --git a/src-tauri/src/commands/window_chrome.rs b/src-tauri/src/commands/window_chrome.rs
+index c40a802..a822ba8 100644
+--- a/src-tauri/src/commands/window_chrome.rs
++++ b/src-tauri/src/commands/window_chrome.rs
+@@ -1,7 +1,8 @@
+ use std::sync::atomic::{AtomicBool, Ordering};
+ 
+-use tauri::{AppHandle, Manager, WebviewWindow};
++use tauri::{AppHandle, Manager, State, WebviewWindow};
+ 
++use crate::app_state::AppState;
+ use crate::error::{AppError, AppResult};
+ 
+ /// When true, CloseRequested may destroy the window / exit the process.
+@@ -43,8 +44,20 @@ pub fn show_main_window(app: AppHandle) -> AppResult<()> {
+     Ok(())
+ }
+ 
++pub async fn best_effort_relay_shutdown(state: &AppState) {
++    let profiles = state
++        .with_workspaces(|store| Ok(store.list().to_vec()))
++        .unwrap_or_default();
++    let _ = tokio::time::timeout(
++        std::time::Duration::from_secs(3),
++        crate::relay::shutdown_profiles(&profiles),
++    )
++    .await;
++}
++
+ #[tauri::command]
+-pub fn quit_app(app: AppHandle) -> AppResult<()> {
++pub async fn quit_app(app: AppHandle, state: State<'_, AppState>) -> AppResult<()> {
++    best_effort_relay_shutdown(&state).await;
+     arm_allow_exit();
+     app.exit(0);
+     Ok(())
+diff --git a/src-tauri/src/commands/workspace.rs b/src-tauri/src/commands/workspace.rs
+index ee7eca2..3b1a0d4 100644
+--- a/src-tauri/src/commands/workspace.rs
++++ b/src-tauri/src/commands/workspace.rs
+@@ -59,6 +59,14 @@ pub fn delete_workspace(state: State<'_, AppState>, id: String) -> AppResult<()>
+             .cloned()
+             .ok_or_else(|| AppError::Message(format!("workspace not found: {id}")))
+     })?;
++    if crate::relay::relay_configured(&profile, crate::tunnel::TunnelServiceKind::Mcp)
++        || crate::relay::relay_configured(&profile, crate::tunnel::TunnelServiceKind::Actions)
++    {
++        return Err(AppError::Message(
++            "该工作区仍有 Cloudflare Quick Tunnel Relay。为避免在 Cloudflare 账户中遗留无法管理的 Worker，请先在 MCP/Actions 隧道配置中删除 Relay，再删除工作区。"
++                .into(),
++        ));
++    }
+     tauri::async_runtime::block_on(drop_tunnel_workspace(&id))?;
+     state.with_runtime(|runtime| {
+         runtime.drop_workspace(&profile);
+diff --git a/src-tauri/src/health/checker.rs b/src-tauri/src/health/checker.rs
+index 37507b4..8aac785 100644
+--- a/src-tauri/src/health/checker.rs
++++ b/src-tauri/src/health/checker.rs
+@@ -292,8 +292,51 @@ fn well_known_url(base: &str, path: &str) -> String {
+ }
+ 
+ fn is_trycloudflare_url(url: &str) -> bool {
+-    let lower = url.to_ascii_lowercase();
+-    lower.contains(".trycloudflare.com") || lower.contains("//trycloudflare.com")
++    reqwest::Url::parse(url)
++        .ok()
++        .and_then(|parsed| parsed.host_str().map(str::to_ascii_lowercase))
++        .is_some_and(|host| host.ends_with(".trycloudflare.com") && host != "trycloudflare.com")
++}
++
++async fn check_relay_health(
++    client: &reqwest::Client,
++    relay_base: &str,
++    expected_service: &str,
++    expect_backend_online: bool,
++) -> (bool, String) {
++    let url = public_endpoint(relay_base, "/__ctm/health");
++    let (code, payload) = match fetch_json(client, &url).await {
++        Ok(value) => value,
++        Err(detail) => return (false, detail),
++    };
++    let ok_flag = payload.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
++    let version = payload
++        .get("relayVersion")
++        .and_then(|v| v.as_str())
++        .unwrap_or("");
++    let service = payload
++        .get("service")
