@@ -1,0 +1,161 @@
++        .and_then(|v| v.as_str())
++        .unwrap_or("");
++    let backend = payload
++        .get("backend")
++        .and_then(|v| v.as_str())
++        .unwrap_or("");
++    let expires = payload
++        .get("expiresIn")
++        .and_then(|v| v.as_u64())
++        .unwrap_or(0);
++    let expected_backend = if expect_backend_online { "online" } else { "offline" };
++    let ok = ok_flag
++        && version == "1"
++        && service == expected_service
++        && backend == expected_backend;
++    (
++        ok,
++        format!(
++            "HTTP {code}; Relay v{version}; service={service}; backend={backend}; lease={expires}s; expected_backend={expected_backend}"
++        ),
++    )
+ }
+ 
+ fn health_item(label: &str, ok: bool, detail: String, hint: &str) -> HealthItem {
+@@ -408,6 +451,27 @@ pub async fn run_health_checks(
+             "Runtime 显示 MCP 正在运行，但本地 endpoint 未正常响应。请查看 MCP 日志。",
+         ));
+ 
++        if profile.mcp_relay_enabled() {
++            let relay_base = profile.mcp_canonical_public_url();
++            let relay_result = check_relay_health(
++                &mcp_public_client,
++                &relay_base,
++                "mcp",
++                context.mcp_tunnel_running,
++            )
++            .await;
++            items.push(health_item(
++                "MCP Quick Tunnel Relay",
++                relay_result.0,
++                relay_result.1,
++                if context.mcp_tunnel_running {
++                    "Relay 必须在线且 backend=online。若 Quick Tunnel 已运行但 backend=offline，请点一次“重新同步 Relay”；程序也会自动续租重试。"
++                } else {
++                    "Quick Tunnel 当前未运行时，Relay backend 应为 offline；若仍 online，说明旧租约尚未正确撤销，将在租约到期后自动失效。"
++                },
++            ));
++        }
++
+         if !mcp_local_ok {
+             for label in [
+                 "公网 /mcp",
+@@ -461,7 +525,12 @@ pub async fn run_health_checks(
+                 ));
+             }
+         } else {
+-            let mcp_public = context.mcp_public_url.trim().trim_end_matches('/').to_string();
++            let mcp_transport = context.mcp_public_url.trim().trim_end_matches('/').to_string();
++            let mcp_public = if profile.mcp_relay_enabled() {
++                profile.mcp_canonical_public_url()
++            } else {
++                mcp_transport.clone()
++            };
+             if mcp_public.is_empty() {
+                 let detail = "Tunnel Supervisor 报告 MCP 隧道正在运行，但没有当前公网 URL。".to_string();
+                 items.push(health_item(
+@@ -486,8 +555,14 @@ pub async fn run_health_checks(
+                 let endpoint = public_endpoint(&mcp_public, "/mcp");
+                 let mut mcp_public_result =
+                     check_mcp_public_url(&mcp_public_client, &endpoint).await;
+-                mcp_public_result.1 =
+-                    format!("{}; 当前实时 Tunnel={}", mcp_public_result.1, mcp_public);
++                mcp_public_result.1 = if profile.mcp_relay_enabled() {
++                    format!(
++                        "{}; 对外 Relay={}; 当前 transport={}",
++                        mcp_public_result.1, mcp_public, mcp_transport
++                    )
++                } else {
++                    format!("{}; 当前实时 Tunnel={}", mcp_public_result.1, mcp_public)
++                };
+                 items.push(public_health_item(
+                     "公网 /mcp",
+                     mcp_public_result.0,
+@@ -514,7 +589,7 @@ pub async fn run_health_checks(
+                         "MCP OAuth 授权元数据",
+                         mcp_oauth_result.0,
+                         mcp_oauth_result.1,
+-                        "OAuth issuer / authorization_endpoint / token_endpoint 必须与当前实时 Tunnel URL 一致。",
++                        "OAuth issuer / authorization_endpoint / token_endpoint 必须与当前对外 canonical origin 一致；Relay 模式下应为稳定 workers.dev 地址。",
+                         mcp_local_ok,
+                         &mcp_public,
+                     ));
+@@ -522,7 +597,7 @@ pub async fn run_health_checks(
+                         "MCP OAuth 受保护资源",
+                         mcp_protected_result.0,
+                         mcp_protected_result.1,
+-                        "resource 与 authorization_servers 必须与当前实时 Tunnel URL 一致。",
++                        "resource 与 authorization_servers 必须与当前对外 canonical origin 一致；Relay 模式下应为稳定 workers.dev 地址。",
+                         mcp_local_ok,
+                         &mcp_public,
+                     ));
+@@ -563,6 +638,27 @@ pub async fn run_health_checks(
+         "Runtime 显示 Actions 正在运行，但本地 /health 未正常响应。请查看 actions-stderr.log。",
+     ));
+ 
++    if profile.actions_relay_enabled() {
++        let relay_base = profile.actions_canonical_public_url();
++        let relay_result = check_relay_health(
++            &actions_public_client,
++            &relay_base,
++            "actions",
++            context.actions_tunnel_running,
++        )
++        .await;
++        items.push(health_item(
++            "Actions Quick Tunnel Relay",
++            relay_result.0,
++            relay_result.1,
++            if context.actions_tunnel_running {
++                "Relay 必须在线且 backend=online。若 Quick Tunnel 已运行但 backend=offline，请重新同步 Relay；程序也会自动续租重试。"
++            } else {
++                "Quick Tunnel 当前未运行时，Relay backend 应为 offline；若仍 online，旧租约将在到期后自动失效。"
++            },
++        ));
++    }
++
+     if !actions_local_ok {
+         for label in [
+             "本地 Actions /openapi.json",
+@@ -632,11 +728,16 @@ pub async fn run_health_checks(
+         return items;
+     }
+ 
+-    let actions_public = context
++    let actions_transport = context
+         .actions_public_url
+         .trim()
+         .trim_end_matches('/')
+         .to_string();
++    let actions_public = if profile.actions_relay_enabled() {
++        profile.actions_canonical_public_url()
++    } else {
++        actions_transport.clone()
++    };
+     if actions_public.is_empty() {
+         let detail =
+             "Tunnel Supervisor 报告 Actions 隧道正在运行，但没有当前公网 URL。".to_string();
+@@ -663,17 +764,23 @@ pub async fn run_health_checks(
+     }
+ 
+     let actions_openapi_public = public_endpoint(&actions_public, "/openapi.json");
+-    let actions_openapi_public_result = check_openapi_server(
++    let mut actions_openapi_public_result = check_openapi_server(
+         &actions_public_client,
+         &actions_openapi_public,
+         &actions_public,
+     )
+     .await;
++    if profile.actions_relay_enabled() {
++        actions_openapi_public_result.1 = format!(
++            "{}; 对外 Relay={}; 当前 transport={}",
