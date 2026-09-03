@@ -1,0 +1,62 @@
+name: Temporary Export Fix6 Baseline
+
+on:
+  push:
+    branches:
+      - tmp-build-coding-tools-mcp-relay-fix7
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout helpers
+        uses: actions/checkout@v4
+
+      - name: Prepare v0.2.0 source
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -L 'https://github.com/mybolide/coding-tools-mcp/archive/4384593b85b66ba5b5f229e19657780c6f6386f6.zip' -o source.zip
+          unzip -q source.zip -d src
+          dir="$(find src -mindepth 1 -maxdepth 1 -type d | head -n1)"
+          mv "$dir" app
+
+      - name: Apply validated fix2 base
+        run: |
+          curl -L 'https://raw.githubusercontent.com/Vetoyi/vetoyi.github.io/10722ad45c61848b41ff5dcb9f3f2e6247a2e567/tmp-build/fix2_apply.py' -o fix2_apply.py
+          python fix2_apply.py
+
+      - name: Apply validated fix3 deltas
+        run: |
+          curl -L 'https://raw.githubusercontent.com/Vetoyi/vetoyi.github.io/6702bcfd0a75c3a33468629de52b72d806eb9866/tmp-build/fix3_delta.py' -o fix3_delta.py
+          python fix3_delta.py
+
+      - name: Apply validated fix4 local OpenAPI delta
+        run: |
+          curl -L 'https://raw.githubusercontent.com/Vetoyi/vetoyi.github.io/5c3124e240ac0846175311e54e4c91ad2cee4496/tmp-build/fix4_delta.py' -o fix4_delta.py
+          python fix4_delta.py
+
+      - name: Apply validated fix5 registered-connection gate
+        run: |
+          curl -L 'https://raw.githubusercontent.com/Vetoyi/vetoyi.github.io/af26b5eab9c842be8415f7910faa3fc05cc32cc1/tmp-build/fix5_delta.py' -o fix5_delta.py
+          python fix5_delta.py
+
+      - name: Apply fix6 lifecycle and diagnostics delta
+        run: python tmp-build/fix6_delta.py
+
+      - name: Apply fix6 cleanup delta
+        run: python tmp-build/fix6_cleanup.py
+
+      - name: Archive exact baseline
+        shell: bash
+        run: zip -qr coding-tools-mcp-fix6-baseline.zip app
+
+      - name: Upload exact baseline
+        uses: actions/upload-artifact@v4
+        with:
+          name: coding-tools-mcp-fix6-baseline
+          path: coding-tools-mcp-fix6-baseline.zip
+          if-no-files-found: error
